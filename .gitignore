@@ -1,0 +1,70 @@
+# ============================================================
+# AI-Drive Analyzer — Root .gitignore
+# ============================================================
+
+# ── Python virtual environment ───────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python cache & build artifacts ──────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+.eggs/
+
+# ── Environment variables (NEVER commit secrets) ─────────────
+.env
+.env.*
+!.env.example
+
+# ── Node.js / Next.js ────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+node_modules/
+
+# ── Python test / lint cache ─────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS generated files ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Alembic / DB ─────────────────────────────────────────────
+*.db
+*.sqlite3
+
+# ── Uploaded / temp files ────────────────────────────────────
+uploads/
+tmp/
+temp/

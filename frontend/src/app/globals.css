@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+
+@layer base {
+  body {
+    @apply bg-[#f8fafc] text-slate-800 font-sans antialiased;
+    min-height: 100vh;
+  }
+  h1, h2, h3, h4 {
+    @apply font-heading text-slate-900;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-white border border-slate-200/80 rounded-2xl shadow-xs transition-all duration-200;
+  }
+  .glass-panel:hover {
+    @apply border-slate-300;
+  }
+  .btn-primary {
+    @apply bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-medium px-4 py-2.5 rounded-xl
+           inline-flex items-center gap-2 cursor-pointer transition-all duration-150
+           shadow-sm shadow-blue-500/20 border-0 text-xs;
+  }
+  .btn-primary:hover {
+    @apply shadow-md shadow-blue-500/25;
+  }
+  .btn-primary:disabled {
+    @apply opacity-50 cursor-not-allowed shadow-none;
+  }
+  .btn-outline {
+    @apply bg-white hover:bg-slate-50 text-slate-700 border border-slate-200/90 px-3 py-1.5 rounded-xl
+           text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer transition-all duration-150 shadow-xs;
+  }
+  .btn-outline:hover {
+    @apply border-slate-300 text-slate-900;
+  }
+  .status-pill {
+    @apply inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full;
+  }
+  .status-pill.passed {
+    @apply bg-emerald-50 text-emerald-700 border border-emerald-200;
+  }
+  .status-pill.confidential {
+    @apply bg-rose-50 text-rose-700 border border-rose-200;
+  }
+  .status-pill.unchecked {
+    @apply bg-amber-50 text-amber-700 border border-amber-200;
+  }
+  .chat-bubble {
+    @apply max-w-[85%] px-4 py-3 rounded-2xl leading-relaxed text-xs;
+  }
+  .chat-bubble.user {
+    @apply self-end bg-blue-600 text-white rounded-tr-sm shadow-sm;
+  }
+  .chat-bubble.ai {
+    @apply self-start bg-white border border-slate-200/80 rounded-tl-sm shadow-xs text-slate-700;
+  }
+}
+
