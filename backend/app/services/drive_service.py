@@ -1,9 +1,17 @@
 import io
+import logging
+import threading
+import time
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from app.config import settings
 from app.models import GoogleAccount
+
+logger = logging.getLogger(__name__)
+_file_catalog_cache = {}
+_file_catalog_cache_lock = threading.Lock()
+
 
 def get_drive_service(google_account: GoogleAccount):
     credentials = Credentials(
@@ -59,6 +67,36 @@ def list_files(google_account: GoogleAccount, page_size: int = 100, q: str = Non
                 print(f"[DRIVE] Error expanding folder {item.get('name')}: {e}")
 
     return all_files
+
+
+def list_files_cached(google_account: GoogleAccount, page_size: int = 100):
+    """Return a short-lived per-account Drive catalog to avoid repeat API calls."""
+    cache_key = (str(google_account.id or google_account.user_id), page_size)
+    now = time.monotonic()
+    ttl = max(settings.DRIVE_FILE_CATALOG_CACHE_TTL_SECONDS, 0)
+
+    if ttl:
+        with _file_catalog_cache_lock:
+            cached = _file_catalog_cache.get(cache_key)
+            if cached and now - cached[0] < ttl:
+                logger.info("[DRIVE] File catalog cache hit for account %s", cache_key)
+                return [dict(item) for item in cached[1]]
+
+    files = list_files(google_account, page_size=page_size)
+    if ttl:
+        with _file_catalog_cache_lock:
+            _file_catalog_cache[cache_key] = (
+                time.monotonic(),
+                [dict(item) for item in files],
+            )
+            while len(_file_catalog_cache) > 128:
+                oldest_key = min(
+                    _file_catalog_cache,
+                    key=lambda key: _file_catalog_cache[key][0],
+                )
+                del _file_catalog_cache[oldest_key]
+    return files
+
 
 def download_file(google_account: GoogleAccount, file_id: str, mime_type: str) -> bytes:
     service = get_drive_service(google_account)

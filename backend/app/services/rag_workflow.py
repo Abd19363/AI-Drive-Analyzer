@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import Awaitable, Callable, TypedDict, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -22,8 +23,10 @@ from app.services.query_adaptive_service import (
     adaptive_embed_for_query,
     adaptive_embed_pdf_for_query,  # kept for backward compat
     chunk_relevance_filter,
+    expand_query_for_retrieval,
     needs_adaptive_embedding,
 )
+from app.services.query_intent_service import QueryIntent
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ class RAGState(TypedDict):
     user_id: str
     google_account: Any
     query: str
+    intent: QueryIntent
     selected_file_ids: Optional[List[str]]
     available_files: List[Dict[str, Any]]
     candidate_files: List[Dict[str, Any]]
@@ -89,15 +93,6 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
         candidate_files = [f for f in candidate_files if not is_media_file(f)]
         logger.info(f"[RAG] Auto-discovery identified {len(candidate_files)} candidate file(s): {[f.get('name') for f in candidate_files]}")
 
-        # Fallback: if AI returned nothing, use all non-folder textual document files (up to 4)
-        if not candidate_files:
-            non_folder_docs = [
-                f for f in available_files
-                if f.get("mimeType") != "application/vnd.google-apps.folder" and not is_media_file(f)
-            ]
-            candidate_files = non_folder_docs[:4]
-            logger.info(f"[RAG] Auto-discovery fallback: using first {len(candidate_files)} non-folder file(s)")
-
     # Expand any candidate folders into their actual document files
     expanded = []
     for cfile in candidate_files:
@@ -136,6 +131,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
 
     safe_files = []
     confidential_files = []
+    files_to_inspect = []
 
     for cfile in candidate_files:
         file_id = cfile.get("id")
@@ -163,7 +159,6 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 if db_file_meta.is_embedded:
                     await db.execute(delete(DocumentChunk).where(DocumentChunk.file_id == db_file_meta.id))
                     db_file_meta.is_embedded = False
-                await db.commit()
             confidential_files.append({
                 "id": file_id,
                 "name": file_name,
@@ -230,24 +225,58 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
             db_file.guardrail_status = "UNCHECKED"
             db_file.confidentiality_reason = None
 
-        # Download file bytes for multi-layer inspection
-        try:
-            file_bytes = await asyncio.to_thread(
-                download_file, google_account, file_id, mime_type
+        files_to_inspect.append({
+            "db_file": db_file,
+            "file_id": file_id,
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "source_modified_time": source_modified_time,
+        })
+
+    await db.flush()
+
+    # Downloads and pure document inspection are independent across files.
+    # Bound concurrency to limit Drive and Vision API pressure.
+    semaphore = asyncio.Semaphore(3)
+
+    async def inspect_file(file_info):
+        async with semaphore:
+            try:
+                file_bytes = await asyncio.to_thread(
+                    download_file,
+                    google_account,
+                    file_info["file_id"],
+                    file_info["mime_type"],
+                )
+            except Exception as exc:
+                return file_info, None, exc
+
+            guard_result = await asyncio.to_thread(
+                run_guardrails,
+                file_info["file_name"],
+                file_info["mime_type"],
+                file_bytes,
             )
-        except Exception as e:
+            return file_info, guard_result, None
+
+    inspection_results = await asyncio.gather(
+        *(inspect_file(file_info) for file_info in files_to_inspect)
+    )
+
+    for file_info, guard_result, download_error in inspection_results:
+        file_id = file_info["file_id"]
+        file_name = file_info["file_name"]
+        db_file = file_info["db_file"]
+
+        if download_error is not None:
             confidential_files.append({
                 "id": file_id,
                 "name": file_name,
-                "reason": f"Unable to download for inspection: {str(e)}"
+                "reason": f"Unable to download for inspection: {download_error}"
             })
             continue
 
-        # Execute Multi-Layer Guardrails (Metadata, OCR, Regex, Heuristic)
-        guard_result = await asyncio.to_thread(
-            run_guardrails, file_name, mime_type, file_bytes
-        )
-        db_file.source_modified_time = source_modified_time
+        db_file.source_modified_time = file_info["source_modified_time"]
         db_file.last_scanned_at = datetime.now(timezone.utc)
 
         if guard_result["is_confidential"]:
@@ -260,7 +289,6 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 snippet_matched=guard_result.get("snippet"),
                 confidence_score=guard_result.get("confidence", 1.0)
             ))
-            await db.commit()
             confidential_files.append({
                 "id": file_id,
                 "name": file_name,
@@ -270,7 +298,6 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
         else:
             db_file.guardrail_status = "PASSED"
             db_file.confidentiality_reason = None
-            await db.commit()
             safe_files.append({
                 "db_id": db_file.id,
                 "file_id": file_id,
@@ -279,15 +306,18 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "is_embedded": db_file.is_embedded
             })
 
+    await db.commit()
+
     return {
         "safe_files": safe_files,
         "confidential_files": confidential_files
     }
 
+
 async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
     """
-    Step 3: Only for verified safe files, create embeddings using all-MiniLM-L6-v2 (384-dim)
-    and store chunks into PostgreSQL pgvector with embedding cache.
+    Step 3: Create embeddings in batches for verified safe files and store
+    their chunks in PostgreSQL pgvector.
     """
     if state.get("is_media_query"):
         return {}
@@ -295,46 +325,54 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
     db = state["db"]
     user_id = state["user_id"]
     safe_files = state["safe_files"]
+    chunks_to_store = []
+    indexed_file_ids = set()
 
     for sfile in safe_files:
         if sfile.get("is_embedded"):
-            # Already indexed and cached in DB
             continue
 
         text_content = sfile.get("extracted_text", "")
         if not text_content.strip():
             continue
 
-        # Chunk text with larger chunks for code/long-form documents
         chunks = chunk_text(text_content, chunk_size=1200, chunk_overlap=150)
         if not chunks:
             continue
 
-        # Get embeddings with embedding cache
-        embeddings = await get_or_create_embeddings(chunks, db)
+        indexed_file_ids.add(sfile["db_id"])
+        chunks_to_store.extend(
+            (sfile, idx, chunk_str)
+            for idx, chunk_str in enumerate(chunks)
+        )
 
-        # Store chunks in database
-        for idx, (chunk_str, emb) in enumerate(zip(chunks, embeddings)):
-            clean_chunk = chunk_str.replace("\x00", "")
-            db_chunk = DocumentChunk(
-                file_id=sfile["db_id"],
-                user_id=user_id,
-                chunk_index=idx,
-                chunk_text=clean_chunk,
-                embedding=emb,
-                token_count=len(clean_chunk.split()),
-                metadata_={"file_name": sfile["name"], "file_id": sfile["file_id"]}
-            )
-            db.add(db_chunk)
+    if not chunks_to_store:
+        return {}
 
-        # Update DriveFile status to embedded
-        res = await db.execute(select(DriveFile).where(DriveFile.id == sfile["db_id"]))
-        rec = res.scalars().first()
-        if rec:
-            rec.is_embedded = True
+    embeddings = await get_or_create_embeddings(
+        [chunk for _, _, chunk in chunks_to_store],
+        db,
+    )
 
-        await db.commit()
+    for (sfile, idx, chunk_str), emb in zip(chunks_to_store, embeddings):
+        clean_chunk = chunk_str.replace("\x00", "")
+        db.add(DocumentChunk(
+            file_id=sfile["db_id"],
+            user_id=user_id,
+            chunk_index=idx,
+            chunk_text=clean_chunk,
+            embedding=emb,
+            token_count=len(clean_chunk.split()),
+            metadata_={"file_name": sfile["name"], "file_id": sfile["file_id"]}
+        ))
 
+    result = await db.execute(
+        select(DriveFile).where(DriveFile.id.in_(indexed_file_ids))
+    )
+    for db_file in result.scalars().all():
+        db_file.is_embedded = True
+
+    await db.commit()
     return {}
 
 async def _run_vector_search(db: AsyncSession, query: str, safe_db_ids: list, limit: int = 25) -> list:
@@ -403,6 +441,7 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
         return {"retrieved_chunks": []}
 
     safe_db_ids = [s["db_id"] for s in safe_files]
+    retrieval_query = expand_query_for_retrieval(query)
 
     # ── ⓪ Full-document shortcut for small/medium files ──────────────────
     # If the total text of all selected files is small enough, skip vector
@@ -429,17 +468,17 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
         return {"retrieved_chunks": full_doc_chunks}
 
     # ── ① Initial vector search ──────────────────────────────────────────
-    retrieved = await _run_vector_search(db, query, safe_db_ids)
+    retrieved = await _run_vector_search(db, retrieval_query, safe_db_ids)
 
     # ── ② Post-retrieval keyword filter (universal, any file type) ───────
-    retrieved = chunk_relevance_filter(retrieved, query)
+    retrieved = chunk_relevance_filter(retrieved, retrieval_query)
     logger.info(
         f"[RAG] After keyword filter: {len(retrieved)} chunks, "
         f"top sim={max((c['similarity'] for c in retrieved), default=0):.3f}"
     )
 
     # ── ③ Adaptive extraction if still insufficient ──────────────────────
-    if needs_adaptive_embedding(retrieved, query):
+    if needs_adaptive_embedding(retrieved, retrieval_query):
         logger.info(
             "[RAG] Results insufficient — triggering universal adaptive extraction."
         )
@@ -462,7 +501,7 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
                     file_bytes=file_bytes,
                     file_name=name,
                     mime_type=mime,
-                    query=query,
+                    query=retrieval_query,
                     db_file_id=db_id,
                     user_id=user_id,
                     db=db,
@@ -474,8 +513,8 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
                 logger.warning(f"[RAG] Adaptive extraction failed for {name}: {exc}")
 
         # Re-run search + filter with fresh embeddings
-        retrieved = await _run_vector_search(db, query, safe_db_ids)
-        retrieved = chunk_relevance_filter(retrieved, query)
+        retrieved = await _run_vector_search(db, retrieval_query, safe_db_ids)
+        retrieved = chunk_relevance_filter(retrieved, retrieval_query)
         logger.info(
             f"[RAG] Post-adaptive: {len(retrieved)} chunks, "
             f"top sim={max((c['similarity'] for c in retrieved), default=0):.3f}, "
@@ -513,6 +552,41 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
         await db.commit()
         return {"answer": MEDIA_QUERY_RESPONSE}
 
+    if state.get("intent") == "document_search" and not retrieved_chunks:
+        searched_names = [
+            file_info.get("name")
+            for file_info in safe_files
+            if file_info.get("name")
+        ]
+        if searched_names:
+            answer = (
+                "I searched the available content in "
+                f"{', '.join(searched_names)} but did not find text identifying "
+                "an agreement or contract. This only covers the documents that "
+                "were searchable for this request."
+            )
+        elif confidential_files:
+            answer = (
+                "I could not verify whether an agreement was present because the "
+                "likely document(s) were withheld by the privacy checks."
+            )
+        else:
+            answer = (
+                "I could not identify searchable documents likely to contain an "
+                "agreement, so I cannot confirm whether one exists in your Drive. "
+                "Try selecting the relevant files or asking with a document name."
+            )
+
+        db.add(ChatQuery(
+            user_id=user_id,
+            query_text=query,
+            identified_files=selected_names,
+            skipped_files=confidential_files,
+            answer_text=answer,
+        ))
+        await db.commit()
+        return {"answer": answer}
+
     answer = await synthesize_answer(
         query,
         retrieved_chunks,
@@ -520,6 +594,7 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
         selected_file_names=selected_names,
         auto_discovered=auto_discovered,
         available_file_names=all_file_names,
+        intent=state.get("intent", "general"),
     )
 
     # Save to chat_queries table
@@ -535,17 +610,36 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
 
     return {"answer": answer}
 
+
+def _timed_node(
+    name: str,
+    node: Callable[[RAGState], Awaitable[Dict[str, Any]]],
+) -> Callable[[RAGState], Awaitable[Dict[str, Any]]]:
+    async def run(state):
+        started_at = time.perf_counter()
+        try:
+            return await node(state)
+        finally:
+            logger.info(
+                "[RAG] Stage %s finished in %.3fs",
+                name,
+                time.perf_counter() - started_at,
+            )
+
+    return run
+
+
 def create_rag_graph():
     """
     Constructs the LangGraph state machine workflow.
     """
     workflow = StateGraph(RAGState)
 
-    workflow.add_node("analyze_query", node_analyze_query)
-    workflow.add_node("guardrail_gate", node_guardrail_gate)
-    workflow.add_node("index_safe_files", node_index_safe_files)
-    workflow.add_node("vector_search", node_vector_search)
-    workflow.add_node("synthesize", node_synthesize)
+    workflow.add_node("analyze_query", _timed_node("analyze_query", node_analyze_query))
+    workflow.add_node("guardrail_gate", _timed_node("guardrail_gate", node_guardrail_gate))
+    workflow.add_node("index_safe_files", _timed_node("index_safe_files", node_index_safe_files))
+    workflow.add_node("vector_search", _timed_node("vector_search", node_vector_search))
+    workflow.add_node("synthesize", _timed_node("synthesize", node_synthesize))
 
     workflow.set_entry_point("analyze_query")
     workflow.add_edge("analyze_query", "guardrail_gate")

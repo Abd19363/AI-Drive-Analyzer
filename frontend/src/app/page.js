@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Navbar from "./components/Navbar";
 import DriveConnector from "./components/DriveConnector";
 import FileList from "./components/FileList";
@@ -25,6 +25,7 @@ export default function Home() {
   const [auditLogs, setAuditLogs] = useState([]);
   const [notification, setNotification] = useState(null);
   const [driveError, setDriveError] = useState(null);
+  const activeQueryRef = useRef(null);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -195,6 +196,9 @@ export default function Home() {
 
   const handleAskQuestion = async (queryText, fileIds = selectedFileIds) => {
     if (!userId) throw new Error("Please connect your Google Drive first.");
+    const queryId = crypto.randomUUID();
+    const controller = new AbortController();
+    activeQueryRef.current = { queryId, controller };
     setIsProcessingQuery(true);
     setCurrentStep("ANALYZING");
     const t1 = setTimeout(() => setCurrentStep("GUARDRAILS"), 800);
@@ -207,9 +211,11 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           user_id: userId,
+          query_id: queryId,
           query: queryText,
           selected_file_ids: fileIds,
         }),
+        signal: controller.signal,
       });
       if (!res.ok) {
         const e = await res.json().catch(() => ({}));
@@ -223,8 +229,31 @@ export default function Home() {
       clearTimeout(t1);
       clearTimeout(t2);
       clearTimeout(t3);
+      if (activeQueryRef.current?.queryId === queryId) {
+        activeQueryRef.current = null;
+      }
       setIsProcessingQuery(false);
       setCurrentStep(null);
+    }
+  };
+
+  const handleCancelQuery = async () => {
+    const activeQuery = activeQueryRef.current;
+    if (!activeQuery) return;
+
+    try {
+      await fetch(`${BACKEND_URL}/api/rag/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          query_id: activeQuery.queryId,
+        }),
+      });
+    } catch (err) {
+      console.error("Failed to cancel query on the server:", err);
+    } finally {
+      activeQuery.controller.abort();
     }
   };
 
@@ -295,6 +324,7 @@ export default function Home() {
 
           <ChatInterface
             onAskQuestion={handleAskQuestion}
+            onCancelQuery={handleCancelQuery}
             isProcessing={isProcessingQuery}
             currentStep={currentStep}
             selectedFiles={selectedFilesList}

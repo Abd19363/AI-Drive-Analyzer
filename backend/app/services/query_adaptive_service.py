@@ -31,8 +31,28 @@ _STOPWORDS = {
     "it", "this", "that", "these", "those", "are", "was", "were", "be", "been",
     "have", "has", "had", "do", "does", "did", "can", "could", "should", "would",
     "may", "might", "must", "will", "shall", "me", "my", "you", "your", "them",
-    "their", "he", "she", "his", "her", "i", "we", "us", "our", "about"
+    "their",     "he", "she", "his", "her", "i", "we", "us", "our", "about", "find",
+    "search", "locate", "identify", "look", "show", "me", "important",
 }
+
+_QUERY_SYNONYMS = {
+    "agreement": (
+        "contract",
+        "memorandum of understanding",
+        "MOU",
+        "NDA",
+        "non-disclosure",
+        "terms",
+        "parties",
+        "obligations",
+    ),
+    "contract": ("agreement", "MOU", "NDA", "terms", "parties", "obligations"),
+}
+_QUERY_TERM_ALIASES = {
+    "aggrement": "agreement",
+    "aggreement": "agreement",
+}
+
 
 def _extract_query_tokens(query: str) -> List[str]:
     """
@@ -40,7 +60,23 @@ def _extract_query_tokens(query: str) -> List[str]:
     """
     query_lower = query.lower()
     tokens = re.findall(r"[a-zA-Z0-9_\-\.]+", query_lower)
-    return [t for t in tokens if len(t) >= 2 and t not in _STOPWORDS]
+    meaningful_tokens = [t for t in tokens if len(t) >= 2 and t not in _STOPWORDS]
+    expanded_tokens = list(meaningful_tokens)
+
+    for token in meaningful_tokens:
+        normalized = token.rstrip("s")
+        normalized = _QUERY_TERM_ALIASES.get(normalized, normalized)
+        if normalized != token:
+            expanded_tokens.append(normalized)
+        expanded_tokens.extend(_QUERY_SYNONYMS.get(normalized, ()))
+
+    return list(dict.fromkeys(expanded_tokens))
+
+
+def expand_query_for_retrieval(query: str) -> str:
+    """Add domain synonyms to improve recall without changing the user-facing query."""
+    terms = _extract_query_tokens(query)
+    return " ".join(dict.fromkeys([query, *terms]))
 
 def score_chunk_relevance(chunk_text_str: str, query: str) -> int:
     """

@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react";
 import {
   Send,
+  Square,
   Sparkles,
   ShieldCheck,
   AlertTriangle,
@@ -37,6 +38,7 @@ function getStepState(stepKey, currentStep) {
 
 export default function ChatInterface({
   onAskQuestion,
+  onCancelQuery,
   isProcessing,
   currentStep,
   selectedFiles = [],
@@ -111,6 +113,21 @@ export default function ChatInterface({
         },
       ]);
     } catch (err) {
+      if (err.name === "AbortError") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: aiMsgId,
+            sender: "ai",
+            text: "Query cancelled.",
+            time: timeStr,
+            citations: [],
+            blockedFiles: [],
+            candidateFiles: [],
+          },
+        ]);
+        return;
+      }
       console.error("[Chat] Query error:", err);
       setMessages((prev) => [
         ...prev,
@@ -356,6 +373,15 @@ export default function ChatInterface({
             <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm px-4 py-2.5 text-xs text-slate-500 shadow-xs flex items-center gap-2">
               <div className="w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
               <span>Analyzing your documents...</span>
+              <button
+                type="button"
+                onClick={onCancelQuery}
+                className="ml-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-rose-600 hover:bg-rose-50"
+                title="Cancel the current query"
+              >
+                <Square size={10} fill="currentColor" />
+                Cancel
+              </button>
             </div>
           </div>
         )}

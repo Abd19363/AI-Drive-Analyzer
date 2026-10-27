@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import List, Dict, Any, Optional
 from google import genai
@@ -87,6 +88,29 @@ def generate_content_with_fallback(client, contents, config=None):
         "Please retry in a few minutes."
     ) from last_err
 
+
+def _match_files_by_title(
+    query: str, available_files: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Resolve explicit document-title mentions without a Gemini round trip."""
+    query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+    ignored_terms = {"the", "a", "an", "of", "for", "to", "in", "on", "about"}
+    matches = []
+
+    for file_info in available_files:
+        name = file_info.get("name", "")
+        title = os.path.splitext(name)[0]
+        title_terms = {
+            term
+            for term in re.findall(r"[a-z0-9]+", title.lower())
+            if term not in ignored_terms
+        }
+        if title_terms and title_terms.issubset(query_terms):
+            matches.append(file_info)
+
+    return matches[:5]
+
+
 async def analyze_query_for_drive_files(query: str, available_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Uses Gemini to analyze the question and select only the relevant file(s)
@@ -94,6 +118,34 @@ async def analyze_query_for_drive_files(query: str, available_files: List[Dict[s
     """
     if not available_files:
         return []
+
+    title_matches = _match_files_by_title(query, available_files)
+    if title_matches:
+        logger.info(
+            "[RAG] Matched %d file(s) directly from the query title",
+            len(title_matches),
+        )
+        return title_matches
+
+    if re.search(r"\b(agreements?|aggreements?|aggrements?|contracts?|mous?|ndas?)\b", query, re.I):
+        agreement_terms = re.compile(
+            r"\b(agreement|contract|memorandum|mou|nda|non[-\s]?disclosure|"
+            r"legal|lease|terms|service)\b",
+            re.I,
+        )
+        topic_matches = [
+            file_info
+            for file_info in available_files
+            if file_info.get("mimeType") != "application/vnd.google-apps.folder"
+            and agreement_terms.search(file_info.get("name", ""))
+            and not re.search(r"\b(salary|payslip|passport|cnic|bank statement)\b", file_info.get("name", ""), re.I)
+        ]
+        if topic_matches:
+            logger.info(
+                "[RAG] Found %d file(s) with agreement-related titles",
+                len(topic_matches),
+            )
+            return topic_matches[:5]
 
     client = get_gemini_client()
     
@@ -163,6 +215,7 @@ async def synthesize_answer(
     selected_file_names: Optional[List[str]] = None,
     auto_discovered: bool = False,
     available_file_names: Optional[List[str]] = None,
+    intent: str = "general",
 ) -> str:
     """
     Generates the final grounded answer with citations and privacy notices.
@@ -173,16 +226,39 @@ async def synthesize_answer(
 
     selected_files_str = ", ".join(selected_file_names) if selected_file_names else "All active documents"
 
-    # Build numbered context blocks with similarity scores visible
+    # Keep model input bounded to reduce latency and prevent oversized prompts.
     context_blocks = []
-    for idx, chunk in enumerate(retrieved_chunks):
+    remaining_chars = 18000
+    for idx, chunk in enumerate(retrieved_chunks[:12]):
         fname = chunk.get("file_name", "Unknown Document")
         text = chunk.get("chunk_text", "")
         sim = chunk.get("similarity", 0.0)
+        block = f"--- CHUNK {idx+1} | Source: {fname} | Similarity: {sim:.2f} ---\n{text}"
+        if len(block) > remaining_chars:
+            if remaining_chars > 200:
+                block = block[:remaining_chars]
+            else:
+                break
+        if not block.strip():
+            continue
         context_blocks.append(
-            f"--- CHUNK {idx+1} | Source: {fname} | Similarity: {sim:.2f} ---\n{text}"
+            block
         )
+        remaining_chars -= len(block)
+        if remaining_chars <= 0:
+            break
     context_str = "\n\n".join(context_blocks)
+
+    intent_instructions = {
+        "fact": "Answer the specific question directly first, then briefly explain the supporting evidence.",
+        "summary": "Give a concise, organized summary of the main points relevant to the request.",
+        "comparison": "Compare the requested subjects explicitly; use a table when the evidence supports one.",
+        "list": "Return the requested items as a clear list and do not omit relevant entries in the supplied context.",
+        "calculation": "Show the calculation method and result using only values present in the supplied context.",
+        "document_search": "Find and list each relevant agreement or contract in the supplied text. Treat agreement, contract, MOU, NDA, memorandum of understanding, and non-disclosure agreement as related terms. For each match, state the source file and the evidence that it is an agreement. If no supplied text supports a match, say that no matching agreement was found in the searched documents.",
+        "general": "Respond in the format that best fits the user's request.",
+    }
+    answer_style = intent_instructions.get(intent, intent_instructions["general"])
 
     confidential_notice = ""
     if skipped_confidential_files:
@@ -224,6 +300,9 @@ async def synthesize_answer(
 === DOCUMENT CONTENT (READ EVERY CHUNK THOROUGHLY) ===
 {context_str if context_str.strip() else "[NO DOCUMENT CONTENT FOUND]"}
 
+=== RESPONSE INTENT ===
+{intent}: {answer_style}
+
 === PRIVACY BLOCKS ===
 {confidential_notice if confidential_notice else "None"}
 
@@ -236,7 +315,7 @@ Before writing ANY answer, read EVERY chunk above from start to finish. Informat
 Collect ALL facts, numbers, names, dates, lists, tables, and details from ALL chunks that relate to the query. Even if a chunk has low similarity score, it may still contain critical information — include it.
 
 **STEP 3 — ANSWER CONSTRUCTION:**
-- Provide a **complete, thorough, and well-organized** answer using all extracted information.
+- Follow the response intent above and answer using the relevant evidence in the supplied context.
 - If the answer involves lists, tables, steps, or structured data, format them properly.
 - If information is spread across chunks, **synthesize and merge** it into a coherent response.
 - Cite the source file name(s) at the end.
@@ -323,4 +402,3 @@ def sanitize_confidential_output(text: str, query: str = "") -> str:
         return MEDIA_QUERY_RESPONSE
 
     return text
-
