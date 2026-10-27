@@ -29,6 +29,9 @@ const STEP_ORDER = ["ANALYZING", "GUARDRAILS", "EMBEDDING", "ANSWERING"];
 
 function getStepState(stepKey, currentStep) {
   if (!currentStep) return "idle";
+  if (currentStep === "DIRECT_ANSWER") {
+    return stepKey === "ANSWERING" ? "active" : "idle";
+  }
   const ci = STEP_ORDER.indexOf(currentStep);
   const si = STEP_ORDER.indexOf(stepKey);
   if (si < ci) return "completed";
@@ -110,6 +113,9 @@ export default function ChatInterface({
           blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
           autoDiscovered: response?.auto_discovered || false,
           candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
+          needsGeneralConfirmation: response?.needs_general_confirmation || false,
+          originalQuery: userText,
+          originalFileIds: [...selectedFileIds],
         },
       ]);
     } catch (err) {
@@ -147,6 +153,72 @@ export default function ChatInterface({
 
   const handleSuggestionClick = (queryText) => {
     setInputQuery(queryText);
+  };
+
+  const handleGeneralConfirmation = async (message, approved) => {
+    if (!approved) {
+      setMessages((prev) =>
+        prev.map((item) =>
+          item.id === message.id
+            ? { ...item, needsGeneralConfirmation: false }
+            : item
+        )
+      );
+      return;
+    }
+
+    if (isProcessing) return;
+
+    const timeStr = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    setMessages((prev) => [
+      ...prev.map((item) =>
+        item.id === message.id
+          ? { ...item, needsGeneralConfirmation: false }
+          : item
+      ),
+      {
+        id: `user-${Date.now()}`,
+        sender: "user",
+        text: "Yes, please answer generally.",
+        time: timeStr,
+      },
+    ]);
+
+    try {
+      const response = await onAskQuestion(
+        message.originalQuery,
+        message.originalFileIds,
+        true
+      );
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          text: response?.answer || "No response received.",
+          time: timeStr,
+          citations: Array.isArray(response?.retrieved_sources) ? response.retrieved_sources : [],
+          blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
+          autoDiscovered: response?.auto_discovered || false,
+          candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
+        },
+      ]);
+    } catch (err) {
+      console.error("[Chat] General answer error:", err);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          text: `Error: ${err.message || "Failed to process query."}`,
+          time: timeStr,
+          isError: true,
+        },
+      ]);
+    }
   };
 
   return (
@@ -228,8 +300,8 @@ export default function ChatInterface({
             <div className="flex items-center gap-2 min-w-0">
               <Search size={14} className="text-purple-600 flex-shrink-0" />
               <span className="truncate text-slate-700">
-                <strong className="text-purple-900 font-semibold">Auto-Discovery Active:</strong>{" "}
-                Queries will automatically search all your Drive documents to find relevant files.
+                <strong className="text-purple-900 font-semibold">Smart Query Routing:</strong>{" "}
+                Drive-related questions search relevant documents; general questions are answered directly.
               </span>
             </div>
             <span className="bg-purple-100 text-purple-700 font-semibold text-[10px] px-2.5 py-0.5 rounded-full flex-shrink-0">
@@ -293,6 +365,27 @@ export default function ChatInterface({
                   )}
 
                   <p className="whitespace-pre-wrap">{msg.text}</p>
+
+                  {msg.needsGeneralConfirmation && (
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        type="button"
+                        disabled={isProcessing}
+                        onClick={() => handleGeneralConfirmation(msg, true)}
+                        className="rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        Yes, answer generally
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isProcessing}
+                        onClick={() => handleGeneralConfirmation(msg, false)}
+                        className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                      >
+                        No, thanks
+                      </button>
+                    </div>
+                  )}
 
                   {/* Confidential Notice */}
                   {msg.blockedFiles?.length > 0 && (
@@ -372,7 +465,7 @@ export default function ChatInterface({
             </div>
             <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm px-4 py-2.5 text-xs text-slate-500 shadow-xs flex items-center gap-2">
               <div className="w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-              <span>Analyzing your documents...</span>
+              <span>Processing your question...</span>
               <button
                 type="button"
                 onClick={onCancelQuery}
@@ -400,7 +493,7 @@ export default function ChatInterface({
             placeholder={
               selectedFiles.length > 0
                 ? `Ask anything about ${selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} selected files`}...`
-                : "Ask any question — I'll find the right files automatically..."
+                : "Ask a question — I'll answer generally or search relevant Drive files..."
             }
             value={inputQuery}
             onChange={(e) => setInputQuery(e.target.value)}

@@ -8,6 +8,10 @@ from google import genai
 from google.genai import types
 from app.config import settings
 from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE
+from app.services.query_intent_service import (
+    is_document_structure_query,
+    match_files_by_title,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,26 +93,18 @@ def generate_content_with_fallback(client, contents, config=None):
     ) from last_err
 
 
-def _match_files_by_title(
-    query: str, available_files: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Resolve explicit document-title mentions without a Gemini round trip."""
-    query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
-    ignored_terms = {"the", "a", "an", "of", "for", "to", "in", "on", "about"}
-    matches = []
+async def answer_general_query(query: str) -> str:
+    """Answer general questions without loading or analyzing Drive files."""
+    client = get_gemini_client()
+    prompt = f"""You are a helpful AI assistant. Answer the user's general question directly and clearly.
+Do not claim to have searched or analyzed their Google Drive. If the answer is uncertain,
+say so rather than inventing details. Do not provide private personal or financial identifiers.
 
-    for file_info in available_files:
-        name = file_info.get("name", "")
-        title = os.path.splitext(name)[0]
-        title_terms = {
-            term
-            for term in re.findall(r"[a-z0-9]+", title.lower())
-            if term not in ignored_terms
-        }
-        if title_terms and title_terms.issubset(query_terms):
-            matches.append(file_info)
-
-    return matches[:5]
+User question: {query}"""
+    response = await asyncio.to_thread(generate_content_with_fallback, client, prompt)
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response for the general question.")
+    return sanitize_confidential_output(response.text, query)
 
 
 async def analyze_query_for_drive_files(query: str, available_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -119,7 +115,7 @@ async def analyze_query_for_drive_files(query: str, available_files: List[Dict[s
     if not available_files:
         return []
 
-    title_matches = _match_files_by_title(query, available_files)
+    title_matches = match_files_by_title(query, available_files)
     if title_matches:
         logger.info(
             "[RAG] Matched %d file(s) directly from the query title",
@@ -228,8 +224,10 @@ async def synthesize_answer(
 
     # Keep model input bounded to reduce latency and prevent oversized prompts.
     context_blocks = []
-    remaining_chars = 18000
-    for idx, chunk in enumerate(retrieved_chunks[:12]):
+    is_structure_query = is_document_structure_query(query)
+    remaining_chars = 32000 if is_structure_query else 18000
+    chunks_to_include = retrieved_chunks if is_structure_query else retrieved_chunks[:12]
+    for idx, chunk in enumerate(chunks_to_include):
         fname = chunk.get("file_name", "Unknown Document")
         text = chunk.get("chunk_text", "")
         sim = chunk.get("similarity", 0.0)
@@ -250,11 +248,12 @@ async def synthesize_answer(
     context_str = "\n\n".join(context_blocks)
 
     intent_instructions = {
+        "direct_answer": "Answer using only the supplied document evidence. If it does not contain the answer, say that the information was not found rather than using general knowledge.",
         "fact": "Answer the specific question directly first, then briefly explain the supporting evidence.",
         "summary": "Give a concise, organized summary of the main points relevant to the request.",
         "comparison": "Compare the requested subjects explicitly; use a table when the evidence supports one.",
         "list": "Return the requested items as a clear list and do not omit relevant entries in the supplied context.",
-        "calculation": "Show the calculation method and result using only values present in the supplied context.",
+        "calculation": "Show the calculation method and result using only values present in the supplied context. For requests about sections, tabs, worksheets, chapters, parts, or headings, inspect the entire supplied document, count each distinct item once, and provide both the total and the exact names supported by the document. Do not count page breaks or repeated chunk overlap as separate items.",
         "document_search": "Find and list each relevant agreement or contract in the supplied text. Treat agreement, contract, MOU, NDA, memorandum of understanding, and non-disclosure agreement as related terms. For each match, state the source file and the evidence that it is an agreement. If no supplied text supports a match, say that no matching agreement was found in the searched documents.",
         "general": "Respond in the format that best fits the user's request.",
     }
@@ -302,6 +301,7 @@ async def synthesize_answer(
 
 === RESPONSE INTENT ===
 {intent}: {answer_style}
+{"For this structure-inventory request, use all supplied chunks from the named file. Identify the document's actual section or tab labels, count distinct labels once, and list each name; do not infer names or count pages." if is_structure_query else ""}
 
 === PRIVACY BLOCKS ===
 {confidential_notice if confidential_notice else "None"}

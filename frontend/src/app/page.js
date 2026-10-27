@@ -194,16 +194,39 @@ export default function Home() {
     setIsAuditModalOpen(true);
   };
 
-  const handleAskQuestion = async (queryText, fileIds = selectedFileIds) => {
+  const handleAskQuestion = async (
+    queryText,
+    fileIds = selectedFileIds,
+    allowGeneralAnswer = false
+  ) => {
     if (!userId) throw new Error("Please connect your Google Drive first.");
+    const intentRes = await fetch(`${BACKEND_URL}/api/rag/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        query: queryText,
+        selected_file_ids: fileIds,
+        allow_general_answer: allowGeneralAnswer,
+      }),
+    });
+    if (!intentRes.ok) {
+      const e = await intentRes.json().catch(() => ({}));
+      throw new Error(e.detail || `Server error ${intentRes.status}`);
+    }
+    const {
+      analysis_required: analysisRequired,
+      matched_file_ids: matchedFileIds = [],
+    } = await intentRes.json();
+
     const queryId = crypto.randomUUID();
     const controller = new AbortController();
     activeQueryRef.current = { queryId, controller };
     setIsProcessingQuery(true);
-    setCurrentStep("ANALYZING");
-    const t1 = setTimeout(() => setCurrentStep("GUARDRAILS"), 800);
-    const t2 = setTimeout(() => setCurrentStep("EMBEDDING"), 1800);
-    const t3 = setTimeout(() => setCurrentStep("ANSWERING"), 3000);
+    setCurrentStep(analysisRequired ? "ANALYZING" : "DIRECT_ANSWER");
+    const t1 = analysisRequired ? setTimeout(() => setCurrentStep("GUARDRAILS"), 800) : null;
+    const t2 = analysisRequired ? setTimeout(() => setCurrentStep("EMBEDDING"), 1800) : null;
+    const t3 = analysisRequired ? setTimeout(() => setCurrentStep("ANSWERING"), 3000) : null;
 
     try {
       const res = await fetch(`${BACKEND_URL}/api/rag/ask`, {
@@ -214,6 +237,8 @@ export default function Home() {
           query_id: queryId,
           query: queryText,
           selected_file_ids: fileIds,
+          matched_file_ids: matchedFileIds,
+          allow_general_answer: allowGeneralAnswer,
         }),
         signal: controller.signal,
       });
@@ -223,7 +248,9 @@ export default function Home() {
       }
       const data = await res.json();
       // Refresh file list in background — must NOT block the return value
-      fetchDriveFiles(userId).catch(console.error);
+      if (data.analysis_required !== false) {
+        fetchDriveFiles(userId).catch(console.error);
+      }
       return data;
     } finally {
       clearTimeout(t1);

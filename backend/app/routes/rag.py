@@ -3,15 +3,27 @@ import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.db import get_db
-from app.models import User, GoogleAccount, ChatQuery
+from app.models import GoogleAccount, ChatQuery
 from app.services.drive_service import list_files_cached
-from app.services.gemini_service import GeminiServiceUnavailableError
-from app.services.rag_workflow import create_rag_graph
-from app.services.query_intent_service import classify_query_intent
+from app.services.gemini_service import (
+    GeminiServiceUnavailableError,
+    answer_general_query,
+)
+from app.services.rag_workflow import (
+    create_rag_graph,
+    search_cached_user_documents,
+)
+from app.services.query_intent_service import (
+    QueryIntent,
+    classify_query_intent,
+    match_files_by_title,
+)
+from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE
+from app.services.gemini_service import synthesize_answer
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 logger = logging.getLogger(__name__)
@@ -21,6 +33,15 @@ class QuestionRequest(BaseModel):
     query: str
     selected_file_ids: Optional[List[str]] = None
     query_id: Optional[str] = None
+    allow_general_answer: bool = False
+    matched_file_ids: Optional[List[str]] = None
+
+
+class QueryIntentRequest(BaseModel):
+    user_id: str
+    query: str
+    selected_file_ids: Optional[List[str]] = None
+    allow_general_answer: bool = False
 
 
 class CancelQueryRequest(BaseModel):
@@ -31,16 +52,128 @@ class CancelQueryRequest(BaseModel):
 rag_graph = create_rag_graph()
 _active_queries: dict[str, tuple[str, asyncio.Task]] = {}
 
+
+def _classify_request_intent(
+    query: str,
+    selected_file_ids: List[str],
+    matched_file_ids: Optional[List[str]] = None,
+) -> QueryIntent:
+    intent = classify_query_intent(
+        query,
+        has_selected_files=bool(selected_file_ids or matched_file_ids),
+    )
+    if intent in {"capabilities", "assistant_info"}:
+        return intent
+    if is_query_about_media(query):
+        return "media"
+    return intent
+
+
+def _requires_document_analysis(intent: QueryIntent) -> bool:
+    return intent not in {"capabilities", "assistant_info", "direct_answer", "media"}
+
+
+def _answer_response(
+    query: str,
+    intent: QueryIntent,
+    answer: str,
+    *,
+    analysis_required: bool,
+    needs_general_confirmation: bool = False,
+    candidate_files: Optional[List[str]] = None,
+    safe_embedded_files: Optional[List[str]] = None,
+    retrieved_sources: Optional[List[Dict[str, Any]]] = None,
+    auto_discovered: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "query": query,
+        "intent": intent,
+        "answer": answer,
+        "analysis_required": analysis_required,
+        "needs_general_confirmation": needs_general_confirmation,
+        "auto_discovered": auto_discovered,
+        "candidate_files": candidate_files or [],
+        "safe_embedded_files": safe_embedded_files or [],
+        "blocked_confidential_files": [],
+        "retrieved_sources": retrieved_sources or [],
+    }
+
+
+async def _save_answer(
+    db: AsyncSession,
+    user_id: str,
+    query: str,
+    answer: str,
+    identified_files: Optional[List[str]] = None,
+) -> None:
+    db.add(ChatQuery(
+        user_id=user_id,
+        query_text=query,
+        identified_files=identified_files or [],
+        skipped_files=[],
+        answer_text=answer,
+    ))
+    await db.commit()
+
+
+@router.post("/intent")
+async def classify_question(
+    payload: QueryIntentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    matched_file_ids: List[str] = []
+    selected_file_ids = payload.selected_file_ids or []
+    if not payload.allow_general_answer:
+        account_result = await db.execute(
+            select(GoogleAccount).where(GoogleAccount.user_id == payload.user_id)
+        )
+        google_account = account_result.scalars().first()
+        if google_account:
+            try:
+                available_files = await asyncio.to_thread(
+                    list_files_cached, google_account, page_size=100
+                )
+            except Exception as exc:
+                logger.exception("Failed to load Drive file names for query routing.")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to check Drive file names for this question.",
+                ) from exc
+            matched_files = match_files_by_title(query, available_files)
+            matched_file_ids = [
+                file_info["id"]
+                for file_info in matched_files
+                if file_info.get("id")
+            ]
+
+    intent = _classify_request_intent(
+        query,
+        selected_file_ids,
+        matched_file_ids,
+    )
+    if payload.allow_general_answer:
+        return {
+            "intent": intent,
+            "analysis_required": False,
+            "matched_file_ids": [],
+        }
+
+    return {
+        "intent": intent,
+        "analysis_required": _requires_document_analysis(intent),
+        "matched_file_ids": matched_file_ids,
+    }
+
+
 @router.post("/ask")
 async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_db)):
     """
-    On-Demand RAG Query Endpoint:
-    1. Does NOT embed all files upfront.
-    2. Takes user query and selected file(s) (or automatically discovers if none selected).
-    3. Runs candidate files through 4-layer privacy guardrail (OCR, Regex, Metadata).
-    4. Confidentials are blocked and excluded from embeddings.
-    5. Safe candidates are chunked & embedded with all-MiniLM-L6-v2 (384-dim).
-    6. Vector search + Gemini response with citations and out-of-scope detection.
+    Search approved indexed content first, then inspect Drive candidates. Only
+    after both searches fail does the user get an option for a general answer.
     """
     user_id = payload.user_id
     query = payload.query.strip()
@@ -49,7 +182,25 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    intent = classify_query_intent(query)
+    matched_file_ids = payload.matched_file_ids or []
+    retrieval_file_ids = matched_file_ids or selected_file_ids
+    intent = _classify_request_intent(
+        query,
+        selected_file_ids,
+        matched_file_ids,
+    )
+    if payload.allow_general_answer and intent not in {
+        "capabilities", "assistant_info", "media"
+    }:
+        try:
+            answer = await answer_general_query(query)
+        except GeminiServiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        await _save_answer(db, user_id, query, answer)
+        return _answer_response(
+            query, intent, answer, analysis_required=False
+        )
+
     if intent == "capabilities":
         answer = (
             "I can retrieve and answer questions from textual documents including "
@@ -72,34 +223,90 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
             "extracted, and indexed before it can be searched. I do not analyze "
             "unrelated files to answer general questions about how this process works."
         )
+    elif intent == "media":
+        answer = MEDIA_QUERY_RESPONSE
     else:
         answer = None
 
     if answer is not None:
-        db.add(ChatQuery(
-            user_id=user_id,
-            query_text=query,
-            identified_files=[],
-            skipped_files=[],
-            answer_text=answer,
+        await _save_answer(db, user_id, query, answer)
+        return _answer_response(
+            query, intent, answer, analysis_required=False
+        )
+
+    if intent == "direct_answer":
+        try:
+            answer = await answer_general_query(query)
+        except GeminiServiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        await _save_answer(db, user_id, query, answer)
+        return _answer_response(
+            query, intent, answer, analysis_required=False
+        )
+
+    try:
+        cached_chunks = await search_cached_user_documents(
+            db, user_id, query, retrieval_file_ids
+        )
+    except Exception as exc:
+        logger.exception("Failed to search the indexed document cache.")
+        raise HTTPException(
+            status_code=500, detail="Failed to search the document cache."
+        ) from exc
+
+    if cached_chunks:
+        cached_names = list(dict.fromkeys(
+            chunk.get("file_name")
+            for chunk in cached_chunks
+            if chunk.get("file_name")
         ))
-        await db.commit()
-        return {
-            "query": query,
-            "intent": intent,
-            "answer": answer,
-            "auto_discovered": False,
-            "candidate_files": [],
-            "safe_embedded_files": [],
-            "blocked_confidential_files": [],
-            "retrieved_sources": [],
-        }
+        try:
+            answer = await synthesize_answer(
+                query,
+                cached_chunks,
+                [],
+                selected_file_names=cached_names,
+                auto_discovered=not retrieval_file_ids,
+                available_file_names=cached_names,
+                intent=intent,
+            )
+        except GeminiServiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        await _save_answer(db, user_id, query, answer, cached_names)
+        return _answer_response(
+            query,
+            intent,
+            answer,
+            analysis_required=True,
+            candidate_files=cached_names,
+            safe_embedded_files=cached_names,
+            retrieved_sources=[
+                {
+                    "file_name": chunk.get("file_name"),
+                    "similarity": round(chunk.get("similarity", 0), 3),
+                }
+                for chunk in cached_chunks
+            ],
+            auto_discovered=not retrieval_file_ids,
+        )
 
     # Validate user & drive connection
     acc_res = await db.execute(select(GoogleAccount).where(GoogleAccount.user_id == user_id))
     google_acc = acc_res.scalars().first()
     if not google_acc:
-        raise HTTPException(status_code=400, detail="Google Drive is not connected.")
+        answer = (
+            "I couldn't find this information in your indexed documents, and "
+            "Google Drive isn't connected to check for a matching file. "
+            "Would you like me to answer using general knowledge instead?"
+        )
+        await _save_answer(db, user_id, query, answer)
+        return _answer_response(
+            query,
+            intent,
+            answer,
+            analysis_required=False,
+            needs_general_confirmation=True,
+        )
 
     current_task = asyncio.current_task()
     if payload.query_id and current_task:
@@ -134,15 +341,16 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
         "google_account": google_acc,
         "query": query,
         "intent": intent,
-        "selected_file_ids": selected_file_ids,
+        "selected_file_ids": retrieval_file_ids,
         "available_files": available_files,
         "candidate_files": [],
         "safe_files": [],
         "confidential_files": [],
         "retrieved_chunks": [],
         "answer": "",
-        "auto_discovered": len(selected_file_ids) == 0,
+        "auto_discovered": len(retrieval_file_ids) == 0,
         "is_media_query": False,
+        "needs_general_confirmation": False,
     }
 
     # Execute LangGraph RAG Workflow
@@ -162,10 +370,21 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
             time.perf_counter() - workflow_started_at,
         )
 
+    if final_state.get("needs_general_confirmation"):
+        return _answer_response(
+            query,
+            intent,
+            final_state.get("answer", ""),
+            analysis_required=False,
+            needs_general_confirmation=True,
+        )
+
     return {
         "query": query,
         "intent": intent,
         "answer": final_state.get("answer"),
+        "analysis_required": True,
+        "needs_general_confirmation": False,
         "auto_discovered": final_state.get("auto_discovered", False),
         "candidate_files": [f.get("name") for f in final_state.get("candidate_files", [])],
         "safe_embedded_files": [f.get("name") for f in final_state.get("safe_files", [])],

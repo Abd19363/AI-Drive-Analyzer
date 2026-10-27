@@ -26,7 +26,7 @@ from app.services.query_adaptive_service import (
     expand_query_for_retrieval,
     needs_adaptive_embedding,
 )
-from app.services.query_intent_service import QueryIntent
+from app.services.query_intent_service import QueryIntent, is_document_structure_query
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class RAGState(TypedDict):
     answer: str
     auto_discovered: bool
     is_media_query: bool
+    needs_general_confirmation: bool
 
 async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
     """
@@ -394,6 +395,52 @@ async def _run_vector_search(db: AsyncSession, query: str, safe_db_ids: list, li
     ]
 
 
+async def search_cached_user_documents(
+    db: AsyncSession,
+    user_id: str,
+    query: str,
+    selected_file_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Search previously indexed, guardrail-approved chunks before accessing Drive."""
+    statement = select(DriveFile.id).where(
+        DriveFile.user_id == user_id,
+        DriveFile.guardrail_status == "PASSED",
+        DriveFile.is_embedded.is_(True),
+    )
+    if selected_file_ids:
+        statement = statement.where(DriveFile.file_id.in_(selected_file_ids))
+
+    result = await db.execute(statement)
+    safe_db_ids = list(result.scalars().all())
+    if not safe_db_ids:
+        return []
+
+    if selected_file_ids and is_document_structure_query(query):
+        statement = (
+            select(DocumentChunk.chunk_text, DriveFile.name)
+            .join(DriveFile, DocumentChunk.file_id == DriveFile.id)
+            .where(
+                DriveFile.id.in_(safe_db_ids),
+                DriveFile.user_id == user_id,
+                DriveFile.guardrail_status == "PASSED",
+                DriveFile.is_embedded.is_(True),
+            )
+            .order_by(DriveFile.name, DocumentChunk.chunk_index)
+        )
+        chunks_result = await db.execute(statement)
+        return [
+            {"chunk_text": row[0], "file_name": row[1], "similarity": 1.0}
+            for row in chunks_result
+        ]
+
+    retrieval_query = expand_query_for_retrieval(query)
+    retrieved = await _run_vector_search(db, retrieval_query, safe_db_ids)
+    retrieved = chunk_relevance_filter(retrieved, retrieval_query)
+    if needs_adaptive_embedding(retrieved, retrieval_query):
+        return []
+    return retrieved[:12]
+
+
 async def _get_full_document_texts(db: AsyncSession, safe_db_ids: list) -> Dict[str, str]:
     """Retrieve all chunk texts per file for full-document fallback."""
     sql = text("""
@@ -450,7 +497,10 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
     full_doc_texts = await _get_full_document_texts(db, safe_db_ids)
     total_chars = sum(len(t) for t in full_doc_texts.values())
 
-    if total_chars > 0 and total_chars <= FULL_DOC_CHAR_LIMIT:
+    if total_chars > 0 and (
+        total_chars <= FULL_DOC_CHAR_LIMIT
+        or is_document_structure_query(query)
+    ):
         logger.info(
             f"[RAG] Full-document shortcut: {len(full_doc_texts)} file(s), "
             f"{total_chars} total chars — sending complete text to LLM."
@@ -551,6 +601,21 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
         db.add(chat_log)
         await db.commit()
         return {"answer": MEDIA_QUERY_RESPONSE}
+
+    if not retrieved_chunks and not confidential_files:
+        answer = (
+            "The information you're asking about isn't in your Google Drive. "
+            "Would you like me to answer using general knowledge instead?"
+        )
+        db.add(ChatQuery(
+            user_id=user_id,
+            query_text=query,
+            identified_files=[],
+            skipped_files=[],
+            answer_text=answer,
+        ))
+        await db.commit()
+        return {"answer": answer, "needs_general_confirmation": True}
 
     if state.get("intent") == "document_search" and not retrieved_chunks:
         searched_names = [
