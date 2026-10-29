@@ -148,14 +148,14 @@ def needs_adaptive_embedding(
         return True
 
     top_similarity = max((c.get("similarity", 0.0) for c in retrieved_chunks), default=0.0)
-    if top_similarity < 0.40:
-        logger.info(f"[AdaptiveGate] Top similarity {top_similarity:.3f} < 0.40 — triggering adaptive extraction.")
+    if top_similarity < 0.25:
+        logger.info(f"[AdaptiveGate] Top similarity {top_similarity:.3f} < 0.25 — triggering adaptive extraction.")
         return True
 
-    # Also trigger if top chunks have zero keyword overlap
+    # Also trigger if top chunks have zero keyword overlap and low similarity
     top_kw = max((c.get("keyword_score", 0) for c in retrieved_chunks[:5]), default=0)
-    if top_kw == 0 and top_similarity < 0.55:
-        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.55 — triggering adaptive.")
+    if top_kw == 0 and top_similarity < 0.35:
+        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.35 — triggering adaptive.")
         return True
 
     return False

@@ -57,26 +57,27 @@ def generate_content_with_fallback(client, contents, config=None):
     """
     models = [
         settings.GEMINI_MODEL,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
     ]
     seen = set()
     unique_models = [m for m in models if m and not (m in seen or seen.add(m))]
 
+    if config is None:
+        config = types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=2048,
+        )
+
     last_err = None
     for model_name in unique_models:
         try:
-            if config:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config
-                )
-            else:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents
-                )
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
         except Exception as e:
             last_err = e
             if _should_try_fallback(e):
@@ -96,12 +97,14 @@ def generate_content_with_fallback(client, contents, config=None):
 async def answer_general_query(query: str) -> str:
     """Answer general questions without loading or analyzing Drive files."""
     client = get_gemini_client()
-    prompt = f"""You are a helpful AI assistant. Answer the user's general question directly and clearly.
+    prompt = f"""You are a helpful, knowledgeable AI assistant. Answer the user's question clearly, descriptively, and in a well-structured format like modern conversational chatbots.
+Use clean Markdown with appropriate headings (###), readable paragraphs, and bullet points. Do NOT put double asterisks around every line or heading.
 Do not claim to have searched or analyzed their Google Drive. If the answer is uncertain,
 say so rather than inventing details. Do not provide private personal or financial identifiers.
 
 User question: {query}"""
-    response = await asyncio.to_thread(generate_content_with_fallback, client, prompt)
+    config = types.GenerateContentConfig(temperature=0.3, max_output_tokens=2048)
+    response = await asyncio.to_thread(generate_content_with_fallback, client, prompt, config)
     if not response.text:
         raise RuntimeError("Gemini returned an empty response for the general question.")
     return sanitize_confidential_output(response.text, query)
@@ -273,11 +276,9 @@ async def synthesize_answer(
     discovery_instruction = ""
     if auto_discovered and selected_file_names:
         discovery_instruction = (
-            f"\n=== AUTO-DISCOVERY REQUIREMENT ===\n"
-            f"The user did NOT manually select files; the system automatically identified relevant document(s) from Google Drive: {selected_files_str}.\n"
-            f"You MUST begin your answer by explicitly presenting these identified files to the user before answering, like this:\n"
-            f"'**Identified Document(s):** {selected_files_str}\n\n'\n"
-            f"Followed by your comprehensive answer.\n"
+            f"\n=== AUTO-DISCOVERY CONTEXT ===\n"
+            f"The system identified relevant document(s) from the user's Google Drive: {selected_files_str}.\n"
+            f"Answer the user's query comprehensively using the information from these documents.\n"
         )
 
     out_of_scope_text = (
@@ -314,11 +315,16 @@ Before writing ANY answer, read EVERY chunk above from start to finish. Informat
 **STEP 2 — COMPREHENSIVE EXTRACTION:**
 Collect ALL facts, numbers, names, dates, lists, tables, and details from ALL chunks that relate to the query. Even if a chunk has low similarity score, it may still contain critical information — include it.
 
-**STEP 3 — ANSWER CONSTRUCTION:**
-- Follow the response intent above and answer using the relevant evidence in the supplied context.
-- If the answer involves lists, tables, steps, or structured data, format them properly.
-- If information is spread across chunks, **synthesize and merge** it into a coherent response.
-- Cite the source file name(s) at the end.
+**STEP 3 — ANSWER CONSTRUCTION & FORMATTING:**
+- Deliver your answer in a descriptive, well-structured, engaging, and professional style as usual modern AI chatbots do.
+- Use clean, standard Markdown:
+  * Divide main concepts or steps using clean Markdown headers (e.g. ### 1. Topic Title).
+  * Use clear bullet points (- or *) or numbered lists for sequential steps and sub-items.
+  * Use **bold** selectively for key terms, definitions, or emphasis. Do NOT wrap entire sentences or every line in double asterisks.
+  * Present comparisons and multi-attribute data in clean Markdown tables.
+  * Use fenced code blocks with language identifiers for any code, queries, or commands.
+- If information is spread across chunks, synthesize and merge it into a coherent, flowing response with readable paragraphs.
+- Cite the source file name(s) cleanly at the end (e.g. Source: DocumentName).
 
 **STEP 4 — OUT-OF-SCOPE CHECK (only after Steps 1-3):**
 ONLY if after reading ALL chunks you genuinely find ZERO relevant information, respond:
@@ -337,8 +343,12 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
 - If files were withheld for privacy, mention why briefly without using internal technical jargon.
 """
 
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=3072,
+    )
     response = await asyncio.to_thread(
-        generate_content_with_fallback, client, prompt
+        generate_content_with_fallback, client, prompt, config
     )
 
     return sanitize_confidential_output(response.text, query)

@@ -199,6 +199,36 @@ def extract_content(file_bytes: bytes, mime_type: str, file_name: str) -> str:
             except Exception:
                 return ""
 
+
+def extract_excel_sheet_text(file_bytes: bytes, requested_sheet_name: str) -> str | None:
+    """Extract only the explicitly requested worksheet, matching its name exactly."""
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    target_name = " ".join(requested_sheet_name.casefold().split())
+    actual_name = next(
+        (
+            name
+            for name in workbook.sheetnames
+            if " ".join(name.casefold().split()) == target_name
+        ),
+        None,
+    )
+    if actual_name is None:
+        workbook.close()
+        return None
+
+    worksheet = workbook[actual_name]
+    lines = [f"[Sheet: {actual_name}]"]
+    for row in worksheet.iter_rows(values_only=True):
+        values = [str(cell) if cell is not None else "" for cell in row]
+        if any(value.strip() for value in values):
+            lines.append(" | ".join(values))
+    sheet_text = "\n".join(lines)
+    workbook.close()
+    return sheet_text
+
+
 def chunk_text(text: str, chunk_size: int = 900, chunk_overlap: int = 120) -> list[str]:
     """
     Split text into coherent, boundary-aware chunks.

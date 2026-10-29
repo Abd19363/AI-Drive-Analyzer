@@ -10,6 +10,19 @@ import { AlertCircle, CheckCircle2, X } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
+async function fetchBackend(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(
+        `Cannot reach the backend at ${BACKEND_URL}. Check that the backend is running and reachable, then retry.`
+      );
+    }
+    throw error;
+  }
+}
+
 export default function Home() {
   const [userId, setUserId] = useState(null);
   const [userEmail, setUserEmail] = useState("");
@@ -197,16 +210,18 @@ export default function Home() {
   const handleAskQuestion = async (
     queryText,
     fileIds = selectedFileIds,
-    allowGeneralAnswer = false
+    allowGeneralAnswer = false,
+    matchedFileIds = []
   ) => {
     if (!userId) throw new Error("Please connect your Google Drive first.");
-    const intentRes = await fetch(`${BACKEND_URL}/api/rag/intent`, {
+    const intentRes = await fetchBackend(`${BACKEND_URL}/api/rag/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         user_id: userId,
         query: queryText,
         selected_file_ids: fileIds,
+        matched_file_ids: matchedFileIds,
         allow_general_answer: allowGeneralAnswer,
       }),
     });
@@ -214,10 +229,14 @@ export default function Home() {
       const e = await intentRes.json().catch(() => ({}));
       throw new Error(e.detail || `Server error ${intentRes.status}`);
     }
+    const intentData = await intentRes.json();
+    if (intentData.cached_response) {
+      return intentData.cached_response;
+    }
     const {
       analysis_required: analysisRequired,
-      matched_file_ids: matchedFileIds = [],
-    } = await intentRes.json();
+      matched_file_ids: routedFileIds = matchedFileIds,
+    } = intentData;
 
     const queryId = crypto.randomUUID();
     const controller = new AbortController();
@@ -229,7 +248,7 @@ export default function Home() {
     const t3 = analysisRequired ? setTimeout(() => setCurrentStep("ANSWERING"), 3000) : null;
 
     try {
-      const res = await fetch(`${BACKEND_URL}/api/rag/ask`, {
+      const res = await fetchBackend(`${BACKEND_URL}/api/rag/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -237,7 +256,7 @@ export default function Home() {
           query_id: queryId,
           query: queryText,
           selected_file_ids: fileIds,
-          matched_file_ids: matchedFileIds,
+          matched_file_ids: routedFileIds,
           allow_general_answer: allowGeneralAnswer,
         }),
         signal: controller.signal,
@@ -261,6 +280,24 @@ export default function Home() {
       }
       setIsProcessingQuery(false);
       setCurrentStep(null);
+    }
+  };
+
+  const handleRecordFallbackDecision = async (message, decision) => {
+    const res = await fetch(`${BACKEND_URL}/api/rag/fallback-decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        query: message.originalQuery,
+        intent: message.intent,
+        selected_file_ids: message.originalFileIds,
+        decision,
+      }),
+    });
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error(e.detail || `Server error ${res.status}`);
     }
   };
 
@@ -352,6 +389,7 @@ export default function Home() {
           <ChatInterface
             onAskQuestion={handleAskQuestion}
             onCancelQuery={handleCancelQuery}
+            onRecordFallbackDecision={handleRecordFallbackDecision}
             isProcessing={isProcessingQuery}
             currentStep={currentStep}
             selectedFiles={selectedFilesList}

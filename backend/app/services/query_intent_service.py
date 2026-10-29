@@ -126,6 +126,83 @@ _STRUCTURE_INVENTORY_PATTERN = re.compile(
     re.I,
 )
 
+_QUOTED_SHEET_PATTERN = re.compile(
+    r"\b(?:in|from|on|within)\s+(?:the\s+)?[\"']([^\"']{1,100})[\"']\s+"
+    r"(?:sheet|tab|worksheet)\b",
+    re.I,
+)
+_QUOTED_TRAILING_SHEET_PATTERN = re.compile(
+    r"[\"']([^\"']{1,100})[\"']\s+(?:sheet|tab|worksheet)\b",
+    re.I,
+)
+_NAMED_SHEET_PATTERN = re.compile(
+    r"\b(?:sheet|tab|worksheet)\s+(?:named|called|titled)\s+"
+    r"[\"']?(.+?)[\"']?(?=\s+(?:for|about|with|that|to|and)\b|[?.!,;]|$)",
+    re.I,
+)
+_PREFIXED_SHEET_PATTERN = re.compile(
+    r"\b(?:in|from|on|within)\s+(?:the\s+)?"
+    r"(?:sheet|tab|worksheet)\s*(?::|=)?\s*[\"']?(.+?)[\"']?"
+    r"(?=\s+(?:for|about|with|that|to|and)\b|[?.!,;]|$)",
+    re.I,
+)
+_TRAILING_SHEET_PATTERN = re.compile(
+    r"\b(?:in|from|on|within)\s+(?:the\s+)?"
+    r"[\"']?([a-z0-9][a-z0-9 _&-]{0,80}?)\s+"
+    r"(?:sheet|tab|worksheet)\b",
+    re.I,
+)
+_IMPLICIT_SHEET_REQUEST_PATTERNS = (
+    re.compile(
+        r"^\s*(?:give me|show me|get me|summari[sz]e|explain|describe|"
+        r"tell me about)\s+(.+?)\s*[?.!]*\s*$",
+        re.I,
+    ),
+)
+
+
+def requested_sheet_name(query: str) -> str | None:
+    """Return a clearly specified worksheet name, without guessing from topics."""
+    for pattern in (
+        _QUOTED_SHEET_PATTERN,
+        _NAMED_SHEET_PATTERN,
+        _PREFIXED_SHEET_PATTERN,
+        _TRAILING_SHEET_PATTERN,
+        _QUOTED_TRAILING_SHEET_PATTERN,
+    ):
+        match = pattern.search(query)
+        if match:
+            name = match.group(1).strip().strip("\"' ")
+            if name:
+                return name
+
+    sheet_marker = re.search(r"\b(?:sheet|tab|worksheet)\b", query, re.I)
+    if sheet_marker:
+        prefix = query[:sheet_marker.start()]
+        for marker in reversed(list(re.finditer(
+            r"\b(?:the|in|from|on|within)\s+",
+            prefix,
+            re.I,
+        ))):
+            name = prefix[marker.end():].strip().strip("\"' ")
+            if name.lower().startswith("the "):
+                name = name[4:].strip()
+            if name and len(name) <= 100 and len(name.split()) <= 8:
+                return name
+    return None
+
+
+def implicit_sheet_name_candidate(query: str) -> str | None:
+    """Extract a likely sheet title from a short imperative query."""
+    for pattern in _IMPLICIT_SHEET_REQUEST_PATTERNS:
+        match = pattern.search(query)
+        if match:
+            candidate = match.group(1).strip().strip("\"' ")
+            if candidate.lower().startswith("the "):
+                candidate = candidate[4:].strip()
+            return candidate or None
+    return None
+
 
 def match_files_by_title(
     query: str, available_files: List[Dict[str, Any]]
@@ -135,7 +212,8 @@ def match_files_by_title(
     ignored_terms = {
         "the", "a", "an", "of", "for", "to", "in", "on", "about", "and",
         "or", "with", "by", "from", "at", "is", "are", "be", "this", "that",
-        "these", "those", "my", "our", "your",
+        "these", "those", "my", "our", "your", "give", "me", "show", "tell",
+        "what", "who", "when", "where", "how", "can", "you", "please",
     }
     exact_matches = []
     partial_matches = []
@@ -173,14 +251,12 @@ def classify_query_intent(
     if not has_selected_files and _EXPLICIT_GENERAL_PATTERN.search(query):
         return "direct_answer"
 
-    requires_document_analysis = (
-        has_selected_files
-        or _DOCUMENT_REQUEST_PATTERN.search(query)
-        or _PERSONAL_CONTEXT_PATTERN.search(query)
-        or _BUSINESS_DATA_PATTERN.search(query)
-        or _TOPIC_RELATION_PATTERN.search(query)
-    )
-    if not requires_document_analysis:
+    # Conversational greetings or casual small talk that should not query Drive
+    if not has_selected_files and re.match(
+        r"^\s*(?:hi|hello|hey|howdy|greetings|good\s+(?:morning|afternoon|evening|day)|how\s+are\s+you|who\s+are\s+you|tell\s+me\s+a\s+joke)\b[?.!]*\s*$",
+        query,
+        re.I,
+    ):
         return "direct_answer"
 
     for intent, pattern in _INTENT_PATTERNS:

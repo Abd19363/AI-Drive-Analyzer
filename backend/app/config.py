@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
     EMBEDDING_DIM: int = 384
     DRIVE_FILE_CATALOG_CACHE_TTL_SECONDS: int = 60
+    QUERY_ANSWER_CACHE_TTL_SECONDS: int = 60
+    GENERAL_ANSWER_CACHE_TTL_SECONDS: int = 86400
+    INSUFFICIENT_ANSWER_CACHE_TTL_SECONDS: int = 30
+    QUERY_DECISION_CACHE_TTL_SECONDS: int = 3600
     
     # Google OAuth 2.0 Credentials (for Google Drive access)
     GOOGLE_CLIENT_ID: str = ""

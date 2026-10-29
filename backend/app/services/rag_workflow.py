@@ -16,7 +16,7 @@ from app.services.guardrail_service import (
     is_query_about_media,
     MEDIA_QUERY_RESPONSE,
 )
-from app.services.extractor_service import chunk_text
+from app.services.extractor_service import chunk_text, extract_excel_sheet_text
 from app.services.embedding_service import get_or_create_embeddings, embed_single_query
 from app.services.gemini_service import analyze_query_for_drive_files, synthesize_answer
 from app.services.query_adaptive_service import (
@@ -26,7 +26,12 @@ from app.services.query_adaptive_service import (
     expand_query_for_retrieval,
     needs_adaptive_embedding,
 )
-from app.services.query_intent_service import QueryIntent, is_document_structure_query
+from app.services.query_intent_service import (
+    QueryIntent,
+    implicit_sheet_name_candidate,
+    is_document_structure_query,
+    requested_sheet_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ class RAGState(TypedDict):
     auto_discovered: bool
     is_media_query: bool
     needs_general_confirmation: bool
+    requested_sheet_name: Optional[str]
+    sheet_scoped_safe_files: List[Dict[str, Any]]
 
 async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
     """
@@ -216,7 +223,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "file_id": file_id,
                 "name": file_name,
                 "extracted_text": "",
-                "is_embedded": True
+                "is_embedded": True,
+                "source_modified_time": db_file.source_modified_time,
             })
             continue
 
@@ -304,7 +312,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "file_id": file_id,
                 "name": file_name,
                 "extracted_text": guard_result.get("extracted_text", ""),
-                "is_embedded": db_file.is_embedded
+                "is_embedded": db_file.is_embedded,
+                "source_modified_time": db_file.source_modified_time,
             })
 
     await db.commit()
@@ -381,7 +390,9 @@ async def _run_vector_search(db: AsyncSession, query: str, safe_db_ids: list, li
     query_vector = await asyncio.to_thread(embed_single_query, query)
     query_vector_str = "[" + ",".join(map(str, query_vector)) + "]"
     sql = text("""
-        SELECT dc.chunk_text, df.name as file_name, 1 - (dc.embedding <=> :qvec) as similarity
+        SELECT dc.chunk_text, df.name as file_name,
+               1 - (dc.embedding <=> :qvec) as similarity,
+               df.file_id, df.source_modified_time
         FROM document_chunks dc
         JOIN drive_files df ON dc.file_id = df.id
         WHERE dc.file_id = ANY(:file_ids)
@@ -390,7 +401,13 @@ async def _run_vector_search(db: AsyncSession, query: str, safe_db_ids: list, li
     """)
     result = await db.execute(sql, {"qvec": query_vector_str, "file_ids": safe_db_ids, "lim": limit})
     return [
-        {"chunk_text": row[0], "file_name": row[1], "similarity": float(row[2])}
+        {
+            "chunk_text": row[0],
+            "file_name": row[1],
+            "similarity": float(row[2]),
+            "file_id": row[3],
+            "source_modified_time": row[4],
+        }
         for row in result
     ]
 
@@ -417,7 +434,12 @@ async def search_cached_user_documents(
 
     if selected_file_ids and is_document_structure_query(query):
         statement = (
-            select(DocumentChunk.chunk_text, DriveFile.name)
+            select(
+                DocumentChunk.chunk_text,
+                DriveFile.name,
+                DriveFile.file_id,
+                DriveFile.source_modified_time,
+            )
             .join(DriveFile, DocumentChunk.file_id == DriveFile.id)
             .where(
                 DriveFile.id.in_(safe_db_ids),
@@ -429,13 +451,22 @@ async def search_cached_user_documents(
         )
         chunks_result = await db.execute(statement)
         return [
-            {"chunk_text": row[0], "file_name": row[1], "similarity": 1.0}
+            {
+                "chunk_text": row[0],
+                "file_name": row[1],
+                "similarity": 1.0,
+                "file_id": row[2],
+                "source_modified_time": row[3],
+            }
             for row in chunks_result
         ]
 
     retrieval_query = expand_query_for_retrieval(query)
     retrieved = await _run_vector_search(db, retrieval_query, safe_db_ids)
     retrieved = chunk_relevance_filter(retrieved, retrieval_query)
+    meaningful = [c for c in retrieved if c.get("similarity", 0) >= 0.22 or c.get("keyword_score", 0) > 0]
+    if meaningful:
+        return meaningful[:12]
     if needs_adaptive_embedding(retrieved, retrieval_query):
         return []
     return retrieved[:12]
@@ -486,6 +517,93 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
 
     if state.get("is_media_query") or not safe_files:
         return {"retrieved_chunks": []}
+
+    requested_sheet = requested_sheet_name(query)
+    sheet_candidate = requested_sheet
+    if not sheet_candidate and state.get("selected_file_ids"):
+        sheet_candidate = implicit_sheet_name_candidate(query)
+    if sheet_candidate:
+        sheet_safe_files = []
+        searched_sheet_files = []
+        sheet_chunk_metadata = []
+        for safe_file in safe_files:
+            file_name = safe_file.get("name", "")
+            db_result = await db.execute(
+                select(DriveFile).where(DriveFile.id == safe_file["db_id"])
+            )
+            db_file = db_result.scalars().first()
+            mime_type = db_file.mime_type if db_file else ""
+            if not (
+                file_name.lower().endswith(".xlsx")
+                or "spreadsheetml" in mime_type
+            ):
+                continue
+
+            searched_sheet_files.append(file_name)
+            file_bytes = await asyncio.to_thread(
+                download_file,
+                google_account,
+                safe_file["file_id"],
+                mime_type,
+            )
+            sheet_text = await asyncio.to_thread(
+                extract_excel_sheet_text,
+                file_bytes,
+                sheet_candidate,
+            )
+            if sheet_text:
+                sheet_safe_files.append(safe_file)
+                for chunk_text_value in chunk_text(
+                    sheet_text,
+                    chunk_size=1200,
+                    chunk_overlap=150,
+                ):
+                    sheet_chunk_metadata.append({
+                        "chunk_text": chunk_text_value,
+                        "file_name": file_name,
+                        "file_id": safe_file["file_id"],
+                        "source_modified_time": safe_file.get(
+                            "source_modified_time"
+                        ),
+                        "sheet_name": sheet_candidate,
+                    })
+
+        retrieved_chunks = []
+        if sheet_chunk_metadata:
+            sheet_embeddings = await get_or_create_embeddings(
+                [item["chunk_text"] for item in sheet_chunk_metadata],
+                db,
+            )
+            query_embedding = await asyncio.to_thread(
+                embed_single_query,
+                expand_query_for_retrieval(query),
+            )
+            semantic_chunks = []
+            for item, embedding in zip(sheet_chunk_metadata, sheet_embeddings):
+                semantic_chunks.append({
+                    **item,
+                    "similarity": sum(
+                        float(query_value) * float(chunk_value)
+                        for query_value, chunk_value in zip(
+                            query_embedding,
+                            embedding,
+                        )
+                    ),
+                })
+            retrieved_chunks = chunk_relevance_filter(
+                semantic_chunks,
+                query,
+            )
+            if not is_document_structure_query(query):
+                retrieved_chunks = retrieved_chunks[:12]
+
+        if requested_sheet or retrieved_chunks:
+            return {
+                "retrieved_chunks": retrieved_chunks,
+                "requested_sheet_name": sheet_candidate,
+                "sheet_scoped_safe_files": sheet_safe_files,
+                "sheet_search_file_names": searched_sheet_files,
+            }
 
     safe_db_ids = [s["db_id"] for s in safe_files]
     retrieval_query = expand_query_for_retrieval(query)
@@ -584,10 +702,20 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
     confidential_files = state.get("confidential_files", [])
     candidate_files = state.get("candidate_files", [])
     safe_files = state.get("safe_files", [])
+    requested_sheet = (
+        state.get("requested_sheet_name") or requested_sheet_name(query)
+    )
+    sheet_scoped_safe_files = state.get("sheet_scoped_safe_files", [])
     auto_discovered = state.get("auto_discovered", False)
     available_files = state.get("available_files", [])
 
-    selected_names = [f.get("name") for f in candidate_files if f.get("name")] or [s.get("name") for s in safe_files if s.get("name")]
+    source_files = sheet_scoped_safe_files if requested_sheet else safe_files
+    selected_names = (
+        [f.get("name") for f in source_files if f.get("name")]
+        if requested_sheet
+        else [f.get("name") for f in candidate_files if f.get("name")]
+        or [s.get("name") for s in safe_files if s.get("name")]
+    )
     all_file_names = [f.get("name") for f in available_files if f.get("name")]
 
     if state.get("is_media_query"):
@@ -601,6 +729,27 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
         db.add(chat_log)
         await db.commit()
         return {"answer": MEDIA_QUERY_RESPONSE}
+
+    if requested_sheet and not retrieved_chunks:
+        searched_file_names = state.get("sheet_search_file_names", [])
+        searched_names = (
+            ", ".join(searched_file_names)
+            or ", ".join(selected_names)
+            or "the searched files"
+        )
+        answer = (
+            f"I couldn't find a worksheet named “{requested_sheet}” in "
+            f"{searched_names}. I did not use information from other sheets or files."
+        )
+        db.add(ChatQuery(
+            user_id=user_id,
+            query_text=query,
+            identified_files=selected_names,
+            skipped_files=[],
+            answer_text=answer,
+        ))
+        await db.commit()
+        return {"answer": answer}
 
     if not retrieved_chunks and not confidential_files:
         answer = (

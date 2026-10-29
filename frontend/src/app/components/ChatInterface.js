@@ -17,6 +17,7 @@ import {
   ChevronRight,
   FileCheck2
 } from "lucide-react";
+import MarkdownRenderer from "./MarkdownRenderer";
 
 const PIPELINE_STEPS = [
   { key: "ANALYZING", stepNum: "1", label: "Finding Relevant Files" },
@@ -42,6 +43,7 @@ function getStepState(stepKey, currentStep) {
 export default function ChatInterface({
   onAskQuestion,
   onCancelQuery,
+  onRecordFallbackDecision,
   isProcessing,
   currentStep,
   selectedFiles = [],
@@ -113,9 +115,12 @@ export default function ChatInterface({
           blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
           autoDiscovered: response?.auto_discovered || false,
           candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
+          answerSource: response?.answer_source,
           needsGeneralConfirmation: response?.needs_general_confirmation || false,
           originalQuery: userText,
           originalFileIds: [...selectedFileIds],
+          matchedFileIds: response?.matched_file_ids || [],
+          intent: response?.intent || "general",
         },
       ]);
     } catch (err) {
@@ -164,6 +169,11 @@ export default function ChatInterface({
             : item
         )
       );
+      try {
+        await onRecordFallbackDecision?.(message, "declined");
+      } catch (err) {
+        console.error("[Chat] Failed to record fallback decision:", err);
+      }
       return;
     }
 
@@ -191,7 +201,8 @@ export default function ChatInterface({
       const response = await onAskQuestion(
         message.originalQuery,
         message.originalFileIds,
-        true
+        true,
+        message.matchedFileIds || []
       );
       setMessages((prev) => [
         ...prev,
@@ -204,6 +215,7 @@ export default function ChatInterface({
           blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
           autoDiscovered: response?.auto_discovered || false,
           candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
+          answerSource: response?.answer_source,
         },
       ]);
     } catch (err) {
@@ -364,7 +376,18 @@ export default function ChatInterface({
                     </div>
                   )}
 
-                  <p className="whitespace-pre-wrap">{msg.text}</p>
+                  {msg.answerSource && (
+                    <span className="mb-1 inline-flex w-fit rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                      {msg.answerSource === "google_drive"
+                        ? "Based on Google Drive documents"
+                        : msg.answerSource === "general_knowledge"
+                          ? "General knowledge — not from your documents"
+                          : msg.answerSource === "insufficient_drive_evidence"
+                            ? "No sufficient document evidence"
+                            : "Assistant information"}
+                    </span>
+                  )}
+                  <MarkdownRenderer content={msg.text} />
 
                   {msg.needsGeneralConfirmation && (
                     <div className="mt-3 flex gap-2">

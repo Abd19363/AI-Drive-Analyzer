@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import delete
 from app.db import get_db
 from app.config import settings
-from app.models import User, GoogleAccount
+from app.models import User, GoogleAccount, QueryAnswerCache
 from app.services.auth_service import generate_authorization_url, handle_oauth_callback
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -73,9 +74,11 @@ async def disconnect_google_drive(user_id: str = Query(...), db: AsyncSession = 
     if not google_acc:
         raise HTTPException(status_code=404, detail="No connected Google Drive account found.")
 
+    await db.execute(
+        delete(QueryAnswerCache).where(QueryAnswerCache.user_id == user_id)
+    )
     await db.delete(google_acc)
     await db.commit()
 
     print(f"[AUTH] Google Drive disconnected for user_id={user_id}")
     return {"success": True, "message": "Google Drive disconnected successfully."}
-

@@ -102,3 +102,27 @@ CREATE TABLE IF NOT EXISTS chat_queries (
     answer_text TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- User-scoped answer cache; full document text is never stored here.
+CREATE TABLE IF NOT EXISTS query_answer_cache (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    query_hash VARCHAR(64) NOT NULL,
+    intent VARCHAR(40) NOT NULL,
+    scope_hash VARCHAR(64) NOT NULL,
+    answer_kind VARCHAR(30) NOT NULL,
+    answer_text TEXT NOT NULL,
+    source_file_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_file_names JSONB NOT NULL DEFAULT '[]'::jsonb,
+    document_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+    is_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    is_safe BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    CONSTRAINT uq_query_answer_cache_context
+        UNIQUE (user_id, query_hash, intent, scope_hash, answer_kind)
+);
+
+CREATE INDEX IF NOT EXISTS query_answer_cache_lookup_idx
+    ON query_answer_cache(user_id, query_hash, scope_hash, expires_at);

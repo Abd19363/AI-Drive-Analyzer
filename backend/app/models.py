@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Text, Boolean, Integer, BigInteger, Float,
-    TIMESTAMP, ForeignKey, ARRAY
+    TIMESTAMP, ForeignKey, ARRAY, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
@@ -119,3 +119,33 @@ class ChatQuery(Base):
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     user = relationship("User", back_populates="queries")
+
+
+class QueryAnswerCache(Base):
+    __tablename__ = "query_answer_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "query_hash",
+            "intent",
+            "scope_hash",
+            "answer_kind",
+            name="uq_query_answer_cache_context",
+        ),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    query_hash = Column(String(64), nullable=False, index=True)
+    intent = Column(String(40), nullable=False)
+    scope_hash = Column(String(64), nullable=False)
+    answer_kind = Column(String(30), nullable=False)
+    answer_text = Column(Text, nullable=False)
+    source_file_ids = Column(JSONB, nullable=False, default=list)
+    source_file_names = Column(JSONB, nullable=False, default=list)
+    document_versions = Column(JSONB, nullable=False, default=dict)
+    sources = Column(JSONB, nullable=False, default=list)
+    is_complete = Column(Boolean, nullable=False, default=False)
+    is_safe = Column(Boolean, nullable=False, default=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, default=datetime.utcnow)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False, index=True)
