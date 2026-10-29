@@ -132,8 +132,8 @@ def run_guardrails(file_name: str, mime_type: str, file_bytes: bytes) -> Dict[st
             "extracted_text": ""
         }
 
-    # Stage 2: Content Extraction (including OCR if needed)
-    extracted_text = extract_content(file_bytes, mime_type, file_name)
+    # Stage 2: Fast Content Extraction (disable heavy OCR during guardrail screening)
+    extracted_text = extract_content(file_bytes, mime_type, file_name, run_ocr_if_sparse=False)
 
     # Stage 3: Regex & Custom Validators
     val_flagged, val_reason, val_type, snippet = inspect_content_with_validators(extracted_text)

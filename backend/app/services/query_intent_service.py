@@ -207,30 +207,66 @@ def implicit_sheet_name_candidate(query: str) -> str | None:
 def match_files_by_title(
     query: str, available_files: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Resolve document-title mentions without a Gemini round trip."""
-    query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
-    ignored_terms = {
+    """Resolve document-title mentions accurately using scored relevance."""
+    ignored = {
         "the", "a", "an", "of", "for", "to", "in", "on", "about", "and",
         "or", "with", "by", "from", "at", "is", "are", "be", "this", "that",
         "these", "those", "my", "our", "your", "give", "me", "show", "tell",
         "what", "who", "when", "where", "how", "can", "you", "please",
+        "questions", "question", "names", "name", "contesting", "candidates", "candidate",
     }
-    exact_matches = []
-    partial_matches = []
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t not in ignored]
+    if not q_tokens:
+        return []
+
+    q_nums = [t for t in q_tokens if t.isdigit()]
+    scored = []
 
     for file_info in available_files:
-        title = os.path.splitext(file_info.get("name", ""))[0]
-        title_terms = {
-            term
-            for term in re.findall(r"[a-z0-9]+", title.lower())
-            if term not in ignored_terms
-        }
-        if title_terms and title_terms.issubset(query_terms):
-            exact_matches.append(file_info)
-        elif title_terms.intersection(query_terms):
-            partial_matches.append(file_info)
+        name = file_info.get("name", "")
+        is_folder = file_info.get("mimeType") == "application/vnd.google-apps.folder"
+        base_name = os.path.splitext(name)[0].lower()
+        file_tokens = set(re.findall(r"[a-z0-9]+", base_name))
 
-    return exact_matches[:5] if exact_matches else partial_matches[:5]
+        score = 0
+        matched_tokens = []
+        for qt in q_tokens:
+            if qt in file_tokens:
+                weight = 25 if (qt in q_nums or len(qt) >= 5) else 10
+                score += weight
+                matched_tokens.append(qt)
+            elif any(qt in ft for ft in file_tokens if len(qt) >= 4):
+                score += 5
+                matched_tokens.append(f"~{qt}")
+
+        # Heavy boost for exact numerical codes like '116' in NA-116
+        for num in q_nums:
+            if num in file_tokens:
+                score += 50
+            elif any(num in ft for ft in file_tokens):
+                score += 30
+
+        # Substring phrase match bonus
+        clean_f = re.sub(r"[^a-z0-9]+", " ", base_name)
+        for qt in q_tokens:
+            if len(qt) >= 3 and re.search(r"\b" + re.escape(qt) + r"\b", clean_f):
+                score += 15
+
+        # Penalize pure folders when individual documents match
+        if is_folder:
+            score -= 20
+
+        # Penalize huge textbook-like files (> 15MB) when other documents match
+        size = file_info.get("size")
+        if size and int(size) > 15 * 1024 * 1024:
+            score -= 10
+
+        if score > 0:
+            scored.append((score, file_info))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # Return top 2-3 highest-scoring files
+    return [item[1] for item in scored[:3]]
 
 
 def is_document_structure_query(query: str) -> bool:

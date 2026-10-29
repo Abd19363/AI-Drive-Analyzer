@@ -56,10 +56,10 @@ def generate_content_with_fallback(client, contents, config=None):
     failures; this function only moves to another model after that call fails.
     """
     models = [
-        settings.GEMINI_MODEL,
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-flash-lite-latest",
+        settings.GEMINI_MODEL,        # Always try the .env-configured model first
+        "gemini-2.0-flash",           # Stable GA model as first fallback
+        "gemini-2.0-flash-lite",      # Lightweight GA fallback
+        "gemini-flash-lite-latest",   # Latest alias fallback
     ]
     seen = set()
     unique_models = [m for m in models if m and not (m in seen or seen.add(m))]

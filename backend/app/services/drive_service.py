@@ -40,31 +40,46 @@ def list_files(google_account: GoogleAccount, page_size: int = 100, q: str = Non
 
     all_files = []
     seen_ids = set()
+    folder_items = []
 
     for item in top_items:
         fid = item.get("id")
         if fid not in seen_ids:
             seen_ids.add(fid)
             all_files.append(item)
-
-        # If it's a folder, also discover files directly inside it
         if item.get("mimeType") == "application/vnd.google-apps.folder":
+            folder_items.append(item)
+
+    # Discover files inside folders concurrently to avoid sequential network delays
+    if folder_items:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch_folder_children(folder_item):
             try:
-                folder_id = item.get("id")
-                folder_name = item.get("name")
-                children_res = service.files().list(
-                    q=f"'{folder_id}' in parents and trashed = false",
+                fid = folder_item.get("id")
+                fname = folder_item.get("name")
+                thread_svc = get_drive_service(google_account)
+                children_res = thread_svc.files().list(
+                    q=f"'{fid}' in parents and trashed = false",
                     fields="files(id, name, mimeType, size, webViewLink, createdTime, modifiedTime)",
                     pageSize=100
                 ).execute()
-                for child in children_res.get("files", []):
-                    cid = child.get("id")
-                    if cid not in seen_ids:
-                        seen_ids.add(cid)
-                        child["folder_name"] = folder_name
-                        all_files.append(child)
+                children = children_res.get("files", [])
+                for child in children:
+                    child["folder_name"] = fname
+                return children
             except Exception as e:
-                print(f"[DRIVE] Error expanding folder {item.get('name')}: {e}")
+                logger.warning(f"[DRIVE] Error expanding folder {folder_item.get('name')}: {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            results = executor.map(fetch_folder_children, folder_items)
+            for child_list in results:
+                for child in child_list:
+                    cid = child.get("id")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_files.append(child)
 
     return all_files
 

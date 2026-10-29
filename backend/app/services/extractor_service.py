@@ -11,10 +11,10 @@ if settings.TESSERACT_CMD:
 def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """
     Transcribes text from a scanned document image using Gemini Vision.
-    Extremely accurate for multi-lingual scanned documents, tables, and forms.
+    Uses gemini-3.5-flash directly to avoid 503 spikes on flash-lite models.
     """
     try:
-        from app.services.gemini_service import get_gemini_client, generate_content_with_fallback
+        from app.services.gemini_service import get_gemini_client
         from google.genai import types
         client = get_gemini_client()
         contents = [
@@ -24,21 +24,30 @@ def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg"
                 "Preserve all tables, columns, rows, names, numbers, symbols, titles, and details verbatim."
             )
         ]
-        resp = generate_content_with_fallback(client, contents)
-        return resp.text.strip() if resp and resp.text else ""
+        # Use gemini-3.5-flash which reliably handles vision tasks without 503 errors
+        for model_name in ["gemini-3.5-flash", "gemini-flash-latest"]:
+            try:
+                resp = client.models.generate_content(model=model_name, contents=contents)
+                if resp and resp.text:
+                    return resp.text.strip()
+            except Exception:
+                continue
+        return ""
     except Exception as e:
         print(f"[OCR Vision Error]: {e}")
         return ""
 
-def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True) -> str:
+def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_ocr_pages: int = 2) -> str:
     """
     Extracts text from PDF bytes using PyMuPDF (fitz) or pypdf.
-    If pages contain scanned images and sparse text, falls back to Gemini Vision OCR.
+    If pages contain scanned images and sparse text, optionally runs Gemini Vision OCR
+    up to a capped number of pages (max_ocr_pages) to keep response times fast.
     """
     if not pdf_bytes:
         return ""
 
     extracted_pages = []
+    ocr_pages_done = 0
 
     # 1. Try PyMuPDF (fitz) if available
     try:
@@ -46,13 +55,14 @@ def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True) -> s
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page_idx, page in enumerate(doc):
             pt = (page.get_text() or "").strip()
-            if len(pt) < 40 and run_ocr_if_sparse:
+            if len(pt) < 40 and run_ocr_if_sparse and ocr_pages_done < max_ocr_pages:
                 try:
                     pix = page.get_pixmap(dpi=150)
                     img_bytes = pix.tobytes("jpeg")
                     ocr_res = ocr_image_with_gemini_vision(img_bytes)
                     if ocr_res:
                         pt = (pt + "\n" + ocr_res).strip()
+                        ocr_pages_done += 1
                 except Exception:
                     pass
             if pt:
@@ -65,26 +75,32 @@ def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True) -> s
 
     # 2. Fallback to pypdf (always available)
     try:
+        import warnings
         from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for page_idx, page in enumerate(reader.pages):
-            page_text = (page.extract_text() or "").strip()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*fontTools.*")
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page_idx, page in enumerate(reader.pages):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning, message=".*fontTools.*")
+                    page_text = (page.extract_text() or "").strip()
 
-            # If page text is sparse/scanned, inspect page images and run OCR
-            if len(page_text) < 40 and run_ocr_if_sparse:
-                page_imgs = getattr(page, "images", [])
-                if page_imgs:
-                    for img in page_imgs:
-                        try:
-                            ocr_res = ocr_image_with_gemini_vision(img.data)
-                            if ocr_res:
-                                page_text = (page_text + "\n" + ocr_res).strip()
-                                break  # Primary page image transcribed
-                        except Exception as e:
-                            print(f"[pypdf OCR error on page {page_idx+1}]: {e}")
+                # If page text is sparse/scanned, inspect page images and run OCR (up to max_ocr_pages)
+                if len(page_text) < 40 and run_ocr_if_sparse and ocr_pages_done < max_ocr_pages:
+                    page_imgs = getattr(page, "images", [])
+                    if page_imgs:
+                        for img in page_imgs:
+                            try:
+                                ocr_res = ocr_image_with_gemini_vision(img.data)
+                                if ocr_res:
+                                    page_text = (page_text + "\n" + ocr_res).strip()
+                                    ocr_pages_done += 1
+                                    break  # Primary page image transcribed
+                            except Exception as e:
+                                print(f"[pypdf OCR error on page {page_idx+1}]: {e}")
 
-            if page_text:
-                extracted_pages.append(f"[Page {page_idx + 1}]\n{page_text}")
+                if page_text:
+                    extracted_pages.append(f"[Page {page_idx + 1}]\n{page_text}")
 
         if extracted_pages:
             return "\n\n".join(extracted_pages)
@@ -146,7 +162,7 @@ def extract_text_from_pptx(pptx_bytes: bytes) -> str:
         except Exception:
             return f"[Presentation extraction error: {e}]"
 
-def extract_content(file_bytes: bytes, mime_type: str, file_name: str) -> str:
+def extract_content(file_bytes: bytes, mime_type: str, file_name: str, run_ocr_if_sparse: bool = True) -> str:
     if not file_bytes:
         return ""
 
@@ -159,8 +175,10 @@ def extract_content(file_bytes: bytes, mime_type: str, file_name: str) -> str:
         or name_lower.endswith(".pdf")
         or mime_type in ("application/vnd.google-apps.document", "application/vnd.google-apps.presentation")
     ):
-        return extract_text_from_pdf(file_bytes)
+        return extract_text_from_pdf(file_bytes, run_ocr_if_sparse=run_ocr_if_sparse)
     elif "image" in mime_type or any(name_lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+        if not run_ocr_if_sparse:
+            return ""
         return extract_text_from_image(file_bytes)
     elif "wordprocessingml" in mime_type or name_lower.endswith(".docx"):
         return extract_text_from_docx(file_bytes)

@@ -113,7 +113,12 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
                 and not is_media_file(f)
             ]
             if children:
-                expanded.extend(children[:10])
+                # Rank children inside the folder by relevance to query
+                ranked_children = match_files_by_title(query, children)
+                if ranked_children:
+                    expanded.extend(ranked_children[:3])
+                else:
+                    expanded.extend(children[:2])
             else:
                 expanded.append(cfile)
         else:
@@ -122,7 +127,8 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
 
     seen = set()
     unique_candidates = [f for f in expanded if f.get("id") not in seen and not seen.add(f.get("id"))]
-    return {"candidate_files": unique_candidates, "auto_discovered": auto_discovered, "is_media_query": False}
+    # Cap candidate files to at most 3 to keep processing ultra-responsive
+    return {"candidate_files": unique_candidates[:3], "auto_discovered": auto_discovered, "is_media_query": False}
 
 async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
     """
@@ -258,7 +264,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                     file_info["mime_type"],
                 )
             except Exception as exc:
-                return file_info, None, exc
+                return file_info, None, exc, None
 
             guard_result = await asyncio.to_thread(
                 run_guardrails,
@@ -266,13 +272,13 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 file_info["mime_type"],
                 file_bytes,
             )
-            return file_info, guard_result, None
+            return file_info, guard_result, None, file_bytes
 
     inspection_results = await asyncio.gather(
         *(inspect_file(file_info) for file_info in files_to_inspect)
     )
 
-    for file_info, guard_result, download_error in inspection_results:
+    for file_info, guard_result, download_error, file_bytes in inspection_results:
         file_id = file_info["file_id"]
         file_name = file_info["file_name"]
         db_file = file_info["db_file"]
@@ -311,6 +317,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "db_id": db_file.id,
                 "file_id": file_id,
                 "name": file_name,
+                "mime_type": file_info.get("mime_type", ""),
+                "file_bytes": file_bytes,
                 "extracted_text": guard_result.get("extracted_text", ""),
                 "is_embedded": db_file.is_embedded,
                 "source_modified_time": db_file.source_modified_time,
@@ -343,6 +351,32 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
             continue
 
         text_content = sfile.get("extracted_text", "")
+        if not text_content.strip():
+            # If safe document has sparse/scanned text (e.g. Form-33), run bounded OCR on demand for this single safe file
+            try:
+                from app.services.extractor_service import extract_content
+                file_bytes = sfile.get("file_bytes")
+                if not file_bytes:
+                    google_account = state.get("google_account")
+                    if google_account:
+                        file_bytes = await asyncio.to_thread(
+                            download_file,
+                            google_account,
+                            sfile["file_id"],
+                            sfile.get("mime_type", ""),
+                        )
+                if file_bytes:
+                    text_content = await asyncio.to_thread(
+                        extract_content,
+                        file_bytes,
+                        sfile.get("mime_type", ""),
+                        sfile["name"],
+                        run_ocr_if_sparse=True,
+                    )
+                    sfile["extracted_text"] = text_content
+            except Exception as e:
+                logger.warning(f"On-demand OCR failed for {sfile.get('name')}: {e}")
+
         if not text_content.strip():
             continue
 

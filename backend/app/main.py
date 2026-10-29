@@ -1,4 +1,13 @@
 import os
+import warnings
+
+# Suppress pypdf's fontTools notice — fonttools IS installed; this warning is informational noise.
+warnings.filterwarnings(
+    "ignore",
+    message=".*fontTools.*required to fully parse the encoding of a CFF Type1 font.*",
+    category=UserWarning,
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
