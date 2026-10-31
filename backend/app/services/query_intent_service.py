@@ -491,3 +491,99 @@ def classify_query_intent(
     if re.match(r"^\s*(what|who|when|where|which|how|is|are|does|do|can)\b", query, re.I):
         return "fact"
     return "general"
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs (includes 📄, 📊, etc.)
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U0001F900-\U0001F9FF"  # supplemental symbols
+    "\U0001FA00-\U0001FA6F"  # chess symbols, etc.
+    "\U0001FA70-\U0001FAFF"
+    "\U00002600-\U000026FF"  # misc symbols
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def clean_response_text(text: str) -> str:
+    """
+    Cleans response text ensuring:
+    1. No outer markdown fences (```markdown / ```) or wrapping quotes.
+    2. No emojis or decorative pictographs (📄, 📊, 🔍, etc.).
+    3. No lines wrapped entirely in asterisks (**text** on a full line).
+    4. No orphan asterisks, hyphens, or special character lines.
+    5. Clean start and end of each line (no stray punctuation/special characters).
+    6. Clean start and end of the entire response (no leading/trailing quotes, symbols, or fences).
+    """
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+
+    # 1. Remove outer code fence wrappers
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 2:
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+
+    # 2. Strip outer enclosing quotes
+    if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+        cleaned.startswith("'") and cleaned.endswith("'")
+    ):
+        cleaned = cleaned[1:-1].strip()
+
+    # 3. Strip all emojis
+    cleaned = EMOJI_PATTERN.sub("", cleaned)
+
+    # 4. Clean line by line
+    cleaned_lines = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.rstrip()
+
+        # Remove zero-width and invisible characters
+        line = re.sub(r"[\u200b\u200e\u200f\ufeff]", "", line)
+
+        # Skip lines that are purely special characters (e.g. ***, ---, **, __, ===)
+        if re.match(r"^[\s\*\-\_\~\#\=\:\;]+$", line):
+            continue
+
+        # If an entire line is wrapped in double asterisks, unwrap it (e.g. **Heading** -> Heading)
+        m_bold = re.match(r"^\s*\*\*(.+?)\*\*\s*$", line)
+        if m_bold:
+            line = m_bold.group(1).strip()
+
+        # If an entire line is wrapped in single asterisks, unwrap it (e.g. *Heading* -> Heading)
+        m_italic = re.match(r"^\s*\*(.+?)\*\s*$", line)
+        if m_italic:
+            line = m_italic.group(1).strip()
+
+        # If a line is wrapped in quotes, unwrap it
+        m_quote = re.match(r'^\s*["\'](.+?)["\']\s*$', line)
+        if m_quote:
+            line = m_quote.group(1).strip()
+
+        # Remove trailing backslashes or orphan asterisks at end of line
+        line = re.sub(r"[\\]+$", "", line).rstrip()
+        line = re.sub(r"(?<!\*)\*$", "", line).rstrip()
+
+        # Normalize multiple spaces after bullets or numbers
+        line = re.sub(r"^(\s*[-*])\s{2,}", r"\1 ", line)
+        line = re.sub(r"^(\s*\d+\.)\s{2,}", r"\1 ", line)
+
+        cleaned_lines.append(line)
+
+    result = "\n".join(cleaned_lines).strip()
+
+    # 5. Clean start and end of the entire response:
+    strip_chars = "`*\"'~_#:\\ \t\r\n"
+    result = result.strip(strip_chars)
+
+    return result

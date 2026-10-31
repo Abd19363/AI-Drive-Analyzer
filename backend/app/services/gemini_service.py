@@ -11,6 +11,7 @@ from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RES
 from app.services.query_intent_service import (
     is_document_structure_query,
     match_files_by_title,
+    clean_response_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -493,4 +494,4 @@ def sanitize_confidential_output(text: str, query: str = "") -> str:
     if is_query_about_media(query):
         return MEDIA_QUERY_RESPONSE
 
-    return text
+    return clean_response_text(text)

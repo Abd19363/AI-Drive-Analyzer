@@ -50,6 +50,8 @@ export default function MarkdownRenderer({ content }) {
 
   // Clean up any rogue orphan asterisks or weird standalone markup artifacts
   const normalizedContent = content
+    .replace(/^[\s`*"'~_#:]+/g, "")
+    .replace(/[`*"'~_\\#:\s]+$/g, "")
     .replace(/^(\s*)\*\*(\s*)$/gm, "")
     .replace(/\n{3,}/g, "\n\n");
 

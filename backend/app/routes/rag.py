@@ -27,6 +27,7 @@ from app.services.query_intent_service import (
     is_fast_general_knowledge_query,
     is_drive_inventory_query,
     extract_drive_inventory_target,
+    clean_response_text,
     _DOCUMENT_REQUEST_PATTERN,
     _DOCUMENT_SEARCH_PATTERN,
     _PERSONAL_CONTEXT_PATTERN,
@@ -199,16 +200,15 @@ def _handle_drive_inventory_query(
     query: str,
     available_files: List[Dict[str, Any]],
 ) -> tuple[str, List[str]]:
-    """Answers file existence and drive inventory queries directly from Drive catalog."""
+    """Answers file existence and drive inventory queries directly from Drive catalog without special characters."""
     target, is_vague = extract_drive_inventory_target(query)
 
     if is_vague:
         answer = (
-            "Please specify the file name, document title, or topic you would like me to check "
-            "in your Google Drive (for example: *'Is my resume in my drive?'* or *'Check whether "
-            "Form-33 is in my drive'*)."
+            "Please specify the file name, document title, or topic you would like me to check in your Google Drive "
+            "(for example: Is my resume in my drive? or Check whether Form-33 is in my drive)."
         )
-        return answer, []
+        return clean_response_text(answer), []
 
     if target == "LIST_ALL":
         textual_files = [
@@ -219,19 +219,19 @@ def _handle_drive_inventory_query(
             return "There are currently no document files found in your connected Google Drive.", []
 
         file_lines = []
-        for f in textual_files[:15]:
+        for idx, f in enumerate(textual_files[:15], 1):
             name = f.get("name", "Untitled")
-            file_lines.append(f"- 📄 **{name}**")
+            file_lines.append(f"{idx}. {name}")
 
         remaining = len(textual_files) - 15
-        more_note = f"\n\n*...and {remaining} more file(s).*" if remaining > 0 else ""
+        more_note = f"\n\nAnd {remaining} more file(s)." if remaining > 0 else ""
         answer = (
             f"Here are the document(s) currently available in your Google Drive ({len(textual_files)} total):\n\n"
             + "\n".join(file_lines)
             + more_note
             + "\n\nYou can ask questions about the contents of any of these files or select them on the left."
         )
-        return answer, [f.get("name") for f in textual_files[:5]]
+        return clean_response_text(answer), [f.get("name") for f in textual_files[:5]]
 
     # Specific target search across available_files
     matched = match_files_by_title(target, available_files, minimum_score=15)
@@ -248,31 +248,32 @@ def _handle_drive_inventory_query(
     if matched:
         cand_names = [f.get("name") for f in matched if f.get("name")]
         file_bullets = []
-        for f in matched:
+        for idx, f in enumerate(matched, 1):
             name = f.get("name", "Untitled")
             mod = f.get("modifiedTime", "")
-            date_str = f" (modified {mod[:10]})" if mod else ""
-            file_bullets.append(f"- 📄 **{name}**{date_str}")
+            date_str = f" - Last modified: {mod[:10]}" if mod else ""
+            file_bullets.append(f"{idx}. {name}{date_str}")
 
+        count_phrase = "this document" if len(matched) == 1 else "these documents"
         answer = (
-            f"Yes, I found matching file(s) in your Google Drive:\n\n"
+            "Yes, I found matching file(s) in your Google Drive:\n\n"
             + "\n".join(file_bullets)
-            + f"\n\nWould you like me to answer questions or analyze information from {'this document' if len(matched) == 1 else 'these documents'}?"
+            + f"\n\nWould you like me to answer questions or analyze information from {count_phrase}?"
         )
-        return answer, cand_names
+        return clean_response_text(answer), cand_names
     else:
         sample_files = [f.get("name") for f in available_files[:5] if f.get("name")]
         sample_text = (
             "\n\nSome of the files in your Drive include:\n"
-            + "\n".join(f"- 📄 {name}" for name in sample_files)
+            + "\n".join(f"{idx}. {name}" for idx, name in enumerate(sample_files, 1))
             if sample_files else ""
         )
         answer = (
-            f"I checked your Google Drive files, but found no document matching **\"{target}\"**."
+            f"I checked your Google Drive files, but found no document matching '{target}'."
             + sample_text
             + "\n\nPlease check the spelling or select a file from your Drive list on the left."
         )
-        return answer, []
+        return clean_response_text(answer), []
 
 
 def _answer_response(
@@ -293,7 +294,7 @@ def _answer_response(
     return {
         "query": query,
         "intent": intent,
-        "answer": answer,
+        "answer": clean_response_text(answer),
         "answer_source": answer_source,
         "cached": cached,
         "analysis_required": analysis_required,
@@ -1196,7 +1197,7 @@ async def _ask_question_uncached(
     return {
         "query": query,
         "intent": intent,
-        "answer": answer,
+        "answer": clean_response_text(answer),
         "answer_source": "google_drive",
         "cached": False,
         "analysis_required": True,
