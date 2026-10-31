@@ -31,8 +31,15 @@ _STOPWORDS = {
     "it", "this", "that", "these", "those", "are", "was", "were", "be", "been",
     "have", "has", "had", "do", "does", "did", "can", "could", "should", "would",
     "may", "might", "must", "will", "shall", "me", "my", "you", "your", "them",
-    "their",     "he", "she", "his", "her", "i", "we", "us", "our", "about", "find",
-    "search", "locate", "identify", "look", "show", "me", "important",
+    "their", "he", "she", "his", "her", "i", "we", "us", "our", "about", "find",
+    "search", "locate", "identify", "look", "show", "important",
+    # Additional common words to prevent false keyword triggers on general queries
+    "out", "any", "sort", "matter", "so", "up", "down", "over", "under", "all",
+    "some", "every", "each", "other", "into", "through", "during", "before", "after",
+    "above", "below", "between", "both", "few", "more", "most", "no", "nor", "not",
+    "only", "own", "same", "than", "too", "very", "just", "now", "also", "well",
+    "way", "even", "new", "want", "give", "tell", "say", "ask", "know", "please",
+    "like", "get", "make", "take", "see", "come", "think", "use",
 }
 
 _QUERY_SYNONYMS = {
@@ -147,6 +154,10 @@ def needs_adaptive_embedding(
     if not retrieved_chunks:
         return True
 
+    # If filename or keyword match is strong, adaptive extraction is not needed
+    if any(c.get("filename_matched") or c.get("keyword_score", 0) >= 2 for c in retrieved_chunks):
+        return False
+
     top_similarity = max((c.get("similarity", 0.0) for c in retrieved_chunks), default=0.0)
     if top_similarity < 0.25:
         logger.info(f"[AdaptiveGate] Top similarity {top_similarity:.3f} < 0.25 — triggering adaptive extraction.")
@@ -154,8 +165,8 @@ def needs_adaptive_embedding(
 
     # Also trigger if top chunks have zero keyword overlap and low similarity
     top_kw = max((c.get("keyword_score", 0) for c in retrieved_chunks[:5]), default=0)
-    if top_kw == 0 and top_similarity < 0.35:
-        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.35 — triggering adaptive.")
+    if top_kw == 0 and top_similarity < 0.30:
+        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.30 — triggering adaptive.")
         return True
 
     return False

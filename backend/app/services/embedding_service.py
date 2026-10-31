@@ -1,12 +1,16 @@
 import asyncio
 import hashlib
+import logging
 import threading
 from typing import List
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.future import select
 from app.config import settings
 from app.models import EmbeddingCache
+
+logger = logging.getLogger(__name__)
 
 # Global lazy-loaded embedding model
 _model = None
@@ -57,22 +61,55 @@ async def get_or_create_embeddings(texts: List[str], db: AsyncSession) -> List[L
 
     # If any texts are not in cache, compute their embeddings
     if missing_texts:
+        # ── Deduplicate within this batch by content_hash ──
+        seen_hashes: dict[str, int] = {}          # hash → first missing-list index
+        deduped_indices: list[int] = []
+        deduped_texts: list[str] = []
+        dup_map: dict[int, str] = {}              # orig_idx → hash (for dupes)
+
+        for pos, orig_idx in enumerate(missing_indices):
+            h = hashes[orig_idx]
+            if h not in seen_hashes:
+                seen_hashes[h] = len(deduped_indices)
+                deduped_indices.append(orig_idx)
+                deduped_texts.append(missing_texts[pos])
+            else:
+                dup_map[orig_idx] = h              # will copy later
+
         computed = await asyncio.to_thread(
-            _encode_texts, missing_texts
+            _encode_texts, deduped_texts
         )
-        for idx_in_missing, orig_idx in enumerate(missing_indices):
-            emb_vector = computed[idx_in_missing].tolist()
+
+        # Map computed vectors back (unique entries)
+        hash_to_vector: dict[str, list[float]] = {}
+        for pos, orig_idx in enumerate(deduped_indices):
+            emb_vector = computed[pos].tolist()
             embeddings[orig_idx] = emb_vector
+            hash_to_vector[hashes[orig_idx]] = emb_vector
 
-            # Insert into database cache
-            cache_entry = EmbeddingCache(
-                content_hash=hashes[orig_idx],
-                model_name=settings.EMBEDDING_MODEL_NAME,
-                embedding=emb_vector
+        # Copy vectors for duplicate entries
+        for orig_idx, h in dup_map.items():
+            embeddings[orig_idx] = hash_to_vector[h]
+
+        # ── Bulk upsert with ON CONFLICT DO NOTHING ──
+        if deduped_texts:
+            rows = [
+                {
+                    "content_hash": hashes[orig_idx],
+                    "model_name": settings.EMBEDDING_MODEL_NAME,
+                    "embedding": hash_to_vector[hashes[orig_idx]],
+                }
+                for orig_idx in deduped_indices
+            ]
+            stmt = pg_insert(EmbeddingCache).values(rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["content_hash"])
+            await db.execute(stmt)
+            await db.commit()
+            logger.debug(
+                "Cached %d new embeddings (%d duplicates skipped in batch)",
+                len(deduped_texts),
+                len(dup_map),
             )
-            db.add(cache_entry)
-
-        await db.commit()
 
     return embeddings
 

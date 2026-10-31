@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     # Optional OCR binary path for Windows
     TESSERACT_CMD: str = "tesseract"
 
+    # SMTP Notifications & Email Service
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@aidrive.com"
+
     class Config:
         env_file = ".env"
         extra = "ignore"

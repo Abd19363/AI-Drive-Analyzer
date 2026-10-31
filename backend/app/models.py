@@ -15,6 +15,10 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=True)
+    full_name = Column(String(255), nullable=True)
+    reset_code = Column(String(20), nullable=True)
+    reset_code_expires_at = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
     updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -113,12 +117,66 @@ class ChatQuery(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     query_text = Column(Text, nullable=False)
-    identified_files = Column(JSONB, default=list)
+    identified_files = Column(JSONB, default=list) # files analyzed
     skipped_files = Column(JSONB, default=list)
+    source_file_names = Column(JSONB, default=list) # files referenced
+    responding_file_name = Column(String(500), nullable=True) # file name from which system responds
     answer_text = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     user = relationship("User", back_populates="queries")
+
+
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(255), nullable=False)
+    role = Column(String(50), default="SECONDARY_ADMIN") # "SUPER_ADMIN" (Developer) or "SECONDARY_ADMIN"
+    status = Column(String(50), default="PENDING") # "PENDING", "APPROVED", "REJECTED"
+    request_note = Column(Text, nullable=True)
+    linked_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_by = Column(String(255), nullable=True)
+    approved_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    reset_code = Column(String(20), nullable=True)
+    reset_code_expires_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
+
+from sqlalchemy import event
+
+@event.listens_for(AdminUser, "before_delete")
+def protect_lead_admin_from_orm_delete(mapper, connection, target):
+    """
+    Ensures that the Lead Admin (SUPER_ADMIN) cannot be deleted via ORM or SQL DELETE.
+    The Lead Admin can only be deleted by truncating the admin_users table in the database.
+    """
+    if target.role == "SUPER_ADMIN":
+        raise ValueError(
+            "The Lead Admin (SUPER_ADMIN) is permanently protected and cannot be deleted via DELETE. "
+            "It can only be removed by truncating the admin_users table in the database."
+        )
+
+
+class QueryTelemetry(Base):
+    __tablename__ = "query_telemetry"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    query_id = Column(String(100), nullable=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_email = Column(String(255), nullable=True, index=True)
+    latency_ms = Column(Float, nullable=False, default=0.0)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    cache_hit = Column(Boolean, default=False)
+    api_called = Column(Boolean, default=False)
+    intent = Column(String(50), nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, index=True)
 
 
 class QueryAnswerCache(Base):

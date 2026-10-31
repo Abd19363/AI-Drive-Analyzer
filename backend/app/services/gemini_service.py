@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
 from app.config import settings
-from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE
+from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE, is_media_file
 from app.services.query_intent_service import (
     is_document_structure_query,
     match_files_by_title,
@@ -56,10 +56,9 @@ def generate_content_with_fallback(client, contents, config=None):
     failures; this function only moves to another model after that call fails.
     """
     models = [
-        settings.GEMINI_MODEL,        # Always try the .env-configured model first
-        "gemini-2.0-flash",           # Stable GA model as first fallback
-        "gemini-2.0-flash-lite",      # Lightweight GA fallback
-        "gemini-flash-lite-latest",   # Latest alias fallback
+        settings.GEMINI_MODEL,        # Always try the .env-configured model first (gemini-flash-lite-latest)
+        "gemini-flash-lite-latest",   # Active fast model
+        "gemini-2.5-flash",           # High quality fallback
     ]
     seen = set()
     unique_models = [m for m in models if m and not (m in seen or seen.add(m))]
@@ -110,6 +109,76 @@ User question: {query}"""
     return sanitize_confidential_output(response.text, query)
 
 
+async def classify_general_vs_drive_query(
+    query: str,
+    available_files: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """
+    Intelligently determines whether a query of ANY context is a General Knowledge / Conversational
+    question (which should be answered directly without analyzing Drive files) or a Drive Document
+    query (which specifically requires searching the user's private Google Drive documents).
+    Returns True for General Knowledge queries, False for Drive Document queries.
+    """
+    from app.services.query_intent_service import (
+        is_fast_general_knowledge_query,
+        is_drive_inventory_query,
+        match_files_by_title,
+        _DOCUMENT_REQUEST_PATTERN,
+        _DOCUMENT_SEARCH_PATTERN,
+        _PERSONAL_CONTEXT_PATTERN,
+        _BUSINESS_DATA_PATTERN,
+    )
+
+    if is_fast_general_knowledge_query(query):
+        return True
+
+    if is_drive_inventory_query(query):
+        return False
+
+    # Check explicit document or personal directives
+    if (
+        _DOCUMENT_REQUEST_PATTERN.search(query)
+        or _DOCUMENT_SEARCH_PATTERN.search(query)
+        or _PERSONAL_CONTEXT_PATTERN.search(query)
+        or _BUSINESS_DATA_PATTERN.search(query)
+    ):
+        return False
+
+    # Check if query matches any title in Drive
+    if available_files:
+        matches = match_files_by_title(query, available_files)
+        if matches:
+            return False
+
+    # For queries of ANY other context, use fast Gemini classification (~1s)
+    try:
+        client = get_gemini_client()
+        file_catalog_sample = []
+        if available_files:
+            file_catalog_sample = [f.get("name") for f in available_files[:15] if f.get("name")]
+
+        prompt = f"""You are a query classifier for an AI Drive Document Assistant.
+Determine whether the user query is:
+- GENERAL: A general knowledge, scientific, educational, factual, conversational, programming, or universal world question that does NOT require searching private personal Google Drive files.
+- DRIVE: A query specifically asking about personal, internal, proprietary files, contracts, reports, spreadsheets, or documents in Google Drive.
+
+User Query: "{query}"
+Sample file names in Drive: {json.dumps(file_catalog_sample)}
+
+Reply strictly with either GENERAL or DRIVE."""
+        config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=5)
+        response = await asyncio.wait_for(
+            asyncio.to_thread(generate_content_with_fallback, client, prompt, config),
+            timeout=2.0,
+        )
+        res_text = (response.text or "").strip().upper()
+        logger.info(f"[ROUTER] Fast LLM query classification for '{query}': {res_text}")
+        return res_text.startswith("GENERAL")
+    except Exception as e:
+        logger.warning(f"[ROUTER] Fast LLM classification fallback or timeout: {e}")
+        return False
+
+
 async def analyze_query_for_drive_files(query: str, available_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Uses Gemini to analyze the question and select only the relevant file(s)
@@ -146,6 +215,25 @@ async def analyze_query_for_drive_files(query: str, available_files: List[Dict[s
             )
             return topic_matches[:5]
 
+    textual_files = [
+        f for f in available_files
+        if not is_media_file(f) and f.get("mimeType") != "application/vnd.google-apps.folder"
+    ]
+    if not textual_files:
+        textual_files = available_files
+
+    # Instant keyword fallback check over filenames
+    q_words = [w.lower() for w in query.replace("?", " ").replace(".", " ").replace(",", " ").split() if len(w) > 2]
+    if q_words:
+        keyword_matched = []
+        for f in textual_files:
+            fname = f.get("name", "").lower()
+            if any(w in fname for w in q_words):
+                keyword_matched.append(f)
+        if keyword_matched:
+            logger.info("[RAG] Instant filename keyword match selected %d candidate(s)", len(keyword_matched[:2]))
+            return keyword_matched[:2]
+
     client = get_gemini_client()
     
     file_catalog = [
@@ -153,9 +241,8 @@ async def analyze_query_for_drive_files(query: str, available_files: List[Dict[s
             "file_id": f.get("id"),
             "name": f.get("name"),
             "mime_type": f.get("mimeType"),
-            **({"folder": f.get("folder_name")} if f.get("folder_name") else {})
         }
-        for f in available_files
+        for f in textual_files[:15]
     ]
     
     prompt = f"""
@@ -167,43 +254,27 @@ Here is the list of files found in their Google Drive:
 {json.dumps(file_catalog, indent=2)}
 
 Task:
-Analyze the question and determine which specific file or files are relevant to answering it.
-
-Important Guidelines:
-1. Return ONLY a valid JSON list of file IDs that are relevant. Do NOT include completely unrelated files.
-2. If the user refers to a specific document name or abbreviation (e.g. "NA_Form-33", "Budget", "Resume"), select the matching document file.
-3. If the user asks a topic-based question (e.g. asking about elections, policies, finances, salaries, guides), select the file(s) whose names or types indicate they likely contain the answer. You may select up to 5 relevant files.
-4. If the query asks for a general summary or overview of their files without specifying one, select the primary document files (PDFs, Docs, Sheets, TXT) available in their Drive.
-5. Prioritize actual content documents (PDFs, Docs, Spreadsheets, Presentations, text) over container folders ("application/vnd.google-apps.folder"). If a query asks about a folder or a file stored in a folder, select the document file(s) inside that folder so their text can be retrieved and summarized.
-6. Do NOT select images (PNG, JPG, JPEG, WEBP) or video files (MP4, MKV, MOV, AVI). This system is designed strictly for textual documents (PDFs, Docs, Spreadsheets, Presentations, text).
-7. If none are relevant, return an empty list: [].
-
-Example output:
-["file_id_1", "file_id_2"]
+Analyze the question and determine which specific file is relevant to answering it. Return ONLY a valid JSON list with at most 1 or 2 file IDs, e.g. ["file_id_1"]. If none are relevant, return [].
 """
 
-    response = await asyncio.to_thread(
-        generate_content_with_fallback,
-        client,
-        prompt,
-        types.GenerateContentConfig(response_mime_type="application/json"),
-    )
     try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_content_with_fallback,
+                client,
+                prompt,
+                types.GenerateContentConfig(response_mime_type="application/json"),
+            ),
+            timeout=3.0,
+        )
         selected_ids = json.loads(response.text)
-        if isinstance(selected_ids, list) and selected_ids:
-            return [f for f in available_files if f.get("id") in selected_ids]
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.warning("Gemini returned invalid file-selection JSON: %s", e)
-
-    # Fallback to keyword match in filename
-    q_words = [w.lower() for w in query.replace("?", " ").replace(".", " ").replace(",", " ").split() if len(w) > 2]
-    matched = []
-    for f in available_files:
-        fname = f.get("name", "").lower()
-        if any(w in fname for w in q_words) and f.get("mimeType") != "application/vnd.google-apps.folder":
-            matched.append(f)
-    if matched:
-        return matched
+        if isinstance(selected_ids, list):
+            if selected_ids:
+                return [f for f in textual_files if f.get("id") in selected_ids][:2]
+            logger.info("[RAG] Gemini analyzed Drive catalog and found 0 relevant files for: '%s'", query)
+            return []
+    except Exception as e:
+        logger.warning("Gemini file-selection JSON error or timeout: %s", e)
 
     return []
 
@@ -228,8 +299,8 @@ async def synthesize_answer(
     # Keep model input bounded to reduce latency and prevent oversized prompts.
     context_blocks = []
     is_structure_query = is_document_structure_query(query)
-    remaining_chars = 32000 if is_structure_query else 18000
-    chunks_to_include = retrieved_chunks if is_structure_query else retrieved_chunks[:12]
+    remaining_chars = 24000 if is_structure_query else 10000
+    chunks_to_include = retrieved_chunks if is_structure_query else retrieved_chunks[:8]
     for idx, chunk in enumerate(chunks_to_include):
         fname = chunk.get("file_name", "Unknown Document")
         text = chunk.get("chunk_text", "")
@@ -345,11 +416,22 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
 
     config = types.GenerateContentConfig(
         temperature=0.2,
-        max_output_tokens=3072,
+        max_output_tokens=1536,
     )
-    response = await asyncio.to_thread(
-        generate_content_with_fallback, client, prompt, config
-    )
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_content_with_fallback, client, prompt, config
+            ),
+            timeout=12.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[Gemini] Synthesis hit 14s timeout; generating concise direct answer")
+        fast_config = types.GenerateContentConfig(temperature=0.2, max_output_tokens=512)
+        fast_prompt = f"Answer the user question '{query}' concisely in structured markdown based on this evidence:\n{context_str[:4000]}"
+        response = await asyncio.to_thread(
+            generate_content_with_fallback, client, fast_prompt, fast_config
+        )
 
     return sanitize_confidential_output(response.text, query)
 

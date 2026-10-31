@@ -56,14 +56,28 @@ async def handle_oauth_callback(code: str, db: AsyncSession, state: str = None):
     if not email:
         raise ValueError("Could not retrieve email from Google Account.")
 
-    # Find or create User
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalars().first()
+    # Link to authenticated user if state is a user_id
+    target_user = None
+    if state:
+        try:
+            import uuid as uuid_pkg
+            uid = uuid_pkg.UUID(state)
+            state_user_res = await db.execute(select(User).where(User.id == uid))
+            target_user = state_user_res.scalars().first()
+        except Exception:
+            pass
 
-    if not user:
-        user = User(email=email)
-        db.add(user)
+    if not target_user:
+        # Find or create User by email
+        result = await db.execute(select(User).where(User.email == email))
+        target_user = result.scalars().first()
+
+    if not target_user:
+        target_user = User(email=email)
+        db.add(target_user)
         await db.flush()
+
+    user = target_user
 
     # Find or update GoogleAccount
     acc_result = await db.execute(

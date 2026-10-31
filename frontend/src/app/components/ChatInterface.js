@@ -162,13 +162,20 @@ export default function ChatInterface({
 
   const handleGeneralConfirmation = async (message, approved) => {
     if (!approved) {
-      setMessages((prev) =>
-        prev.map((item) =>
+      setMessages((prev) => [
+        ...prev.map((item) =>
           item.id === message.id
             ? { ...item, needsGeneralConfirmation: false }
             : item
-        )
-      );
+        ),
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          text: "Understood. Please feel free to select specific files from the left sidebar or clarify your question so I can search more effectively.",
+          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          answerSource: "assistant",
+        },
+      ]);
       try {
         await onRecordFallbackDecision?.(message, "declined");
       } catch (err) {
@@ -216,6 +223,8 @@ export default function ChatInterface({
           autoDiscovered: response?.auto_discovered || false,
           candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
           answerSource: response?.answer_source,
+          originalQuery: message.originalQuery,
+          originalFileIds: message.originalFileIds,
         },
       ]);
     } catch (err) {
@@ -226,6 +235,62 @@ export default function ChatInterface({
           id: `ai-${Date.now()}`,
           sender: "ai",
           text: `Error: ${err.message || "Failed to process query."}`,
+          time: timeStr,
+          isError: true,
+        },
+      ]);
+    }
+  };
+
+  const handleForceDriveSearch = async (message) => {
+    if (isProcessing) return;
+    const timeStr = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `user-${Date.now()}`,
+        sender: "user",
+        text: `Search Drive files for: "${message.originalQuery}"`,
+        time: timeStr,
+      },
+    ]);
+    try {
+      const response = await onAskQuestion(
+        message.originalQuery,
+        message.originalFileIds || [],
+        false,
+        message.matchedFileIds || [],
+        true
+      );
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          text: response?.answer || "No response received.",
+          time: timeStr,
+          citations: Array.isArray(response?.retrieved_sources) ? response.retrieved_sources : [],
+          blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
+          autoDiscovered: response?.auto_discovered || false,
+          candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
+          answerSource: response?.answer_source,
+          needsGeneralConfirmation: response?.needs_general_confirmation || false,
+          originalQuery: message.originalQuery,
+          originalFileIds: message.originalFileIds,
+          fromDriveSearch: true,
+        },
+      ]);
+    } catch (err) {
+      console.error("[Chat] Force Drive search error:", err);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          text: `Error: ${err.message || "Failed to search Drive files."}`,
           time: timeStr,
           isError: true,
         },
@@ -389,6 +454,21 @@ export default function ChatInterface({
                   )}
                   <MarkdownRenderer content={msg.text} />
 
+                  {msg.answerSource === "general_knowledge" && !msg.fromDriveSearch && msg.originalQuery && (
+                    <div className="mt-2.5 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>Answered from general knowledge.</span>
+                      <button
+                        type="button"
+                        disabled={isProcessing}
+                        onClick={() => handleForceDriveSearch(msg)}
+                        className="inline-flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-800 hover:underline"
+                      >
+                        <Search size={11} />
+                        Search Drive documents instead
+                      </button>
+                    </div>
+                  )}
+
                   {msg.needsGeneralConfirmation && (
                     <div className="mt-3 flex gap-2">
                       <button
@@ -405,7 +485,7 @@ export default function ChatInterface({
                         onClick={() => handleGeneralConfirmation(msg, false)}
                         className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
                       >
-                        No, thanks
+                        No, clarify query
                       </button>
                     </div>
                   )}
@@ -488,7 +568,7 @@ export default function ChatInterface({
             </div>
             <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm px-4 py-2.5 text-xs text-slate-500 shadow-xs flex items-center gap-2">
               <div className="w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-              <span>Processing your question...</span>
+              <span>Checking files and preparing your answer...</span>
               <button
                 type="button"
                 onClick={onCancelQuery}
@@ -499,6 +579,9 @@ export default function ChatInterface({
                 Cancel
               </button>
             </div>
+            <p className="mt-1 ml-5 text-[10px] leading-relaxed text-slate-400">
+              First-time checks and indexing can take longer. Safe files are indexed to speed up follow-up questions.
+            </p>
           </div>
         )}
 

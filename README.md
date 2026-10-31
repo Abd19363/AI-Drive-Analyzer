@@ -201,7 +201,9 @@ When an answer is not cached, the compiled **LangGraph state machine (`rag_graph
 
 #### Step 1: Candidate File Routing (`node_analyze_query`)
 - **Explicit Selection:** If the user checked specific files in the UI, only those file IDs are used.
-- **AI Auto-Discovery:** If no files were selected, Gemini Flash analyzes the question against the user's Drive file catalog (names, MIME types, folder structure) to select up to 5 relevant files.
+- **Filename-First Routing:** With a warm Drive catalog, strong filename matches (score ≥55) bypass the general-vs-Drive LLM classifier; ambiguous or weak matches retain the existing fallback.
+- **AI Auto-Discovery:** If no files were selected, Gemini Flash analyzes the question against the user's Drive file catalog (names, MIME types, folder structure); at most 3 candidate files proceed to content checks.
+- **Lazy Folder Lookup:** Query handling reads a shallow file catalog first and expands only folders selected as candidates; it does not crawl every folder before candidate selection.
 - **Media Filter:** Queries asking about images or videos are intercepted early with a redirect response (`Please ask query about textual files`).
 
 #### Step 2: Privacy & Guardrail Screening (`node_screen_guardrails`)
@@ -211,6 +213,7 @@ When an answer is not cached, the compiled **LangGraph state machine (`rag_graph
 
 #### Step 3: On-Demand Extraction & Chunking (`node_embed_content`)
 - Safe candidate files are streamed on-demand from Google Drive.
+- Only the safe candidate files for the current query are extracted and embedded; the pipeline does not pre-embed the whole Drive.
 - Multi-format text extraction:
   - **PDF Documents:** Extracted using `pypdf`, backed by `fontTools` to parse embedded CFF Type1 fonts and non-standard character encodings.
   - **Excel Spreadsheets (`.xlsx`, `.xls`):** Parsed via `openpyxl`. If the user asked about a specific worksheet (e.g., `"Sales Data"`), the parser extracts only that worksheet.

@@ -11,7 +11,7 @@ if settings.TESSERACT_CMD:
 def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """
     Transcribes text from a scanned document image using Gemini Vision.
-    Uses gemini-3.5-flash directly to avoid 503 spikes on flash-lite models.
+    Uses fast flash models with bounded execution.
     """
     try:
         from app.services.gemini_service import get_gemini_client
@@ -24,12 +24,25 @@ def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg"
                 "Preserve all tables, columns, rows, names, numbers, symbols, titles, and details verbatim."
             )
         ]
-        # Use gemini-3.5-flash which reliably handles vision tasks without 503 errors
-        for model_name in ["gemini-3.5-flash", "gemini-flash-latest"]:
+        models = [settings.GEMINI_MODEL, "gemini-2.5-flash", "gemini-flash-latest"]
+        seen = set()
+        unique_models = [m for m in models if m and not (m in seen or seen.add(m))]
+        import concurrent.futures
+
+        def _call_vision(model):
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(max_output_tokens=1024, temperature=0.1),
+            )
+
+        for model_name in unique_models:
             try:
-                resp = client.models.generate_content(model=model_name, contents=contents)
-                if resp and resp.text:
-                    return resp.text.strip()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(_call_vision, model_name)
+                    resp = future.result(timeout=3.5)
+                    if resp and resp.text:
+                        return resp.text.strip()
             except Exception:
                 continue
         return ""
@@ -37,7 +50,7 @@ def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg"
         print(f"[OCR Vision Error]: {e}")
         return ""
 
-def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_ocr_pages: int = 2) -> str:
+def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_ocr_pages: int = 1) -> str:
     """
     Extracts text from PDF bytes using PyMuPDF (fitz) or pypdf.
     If pages contain scanned images and sparse text, optionally runs Gemini Vision OCR
@@ -192,11 +205,11 @@ def extract_content(file_bytes: bytes, mime_type: str, file_name: str, run_ocr_i
     elif name_lower.endswith(".xlsx") or "spreadsheetml" in mime_type:
         try:
             import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
             sheet_texts = []
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
-                rows = list(ws.iter_rows(values_only=True))
+                rows = list(ws.iter_rows(max_row=200, values_only=True))
                 if rows:
                     sheet_lines = [f"[Sheet: {sheet_name}]"]
                     for row in rows:
@@ -204,6 +217,7 @@ def extract_content(file_bytes: bytes, mime_type: str, file_name: str, run_ocr_i
                         if any(v.strip() for v in row_vals):
                             sheet_lines.append(" | ".join(row_vals))
                     sheet_texts.append("\n".join(sheet_lines))
+            wb.close()
             return "\n\n".join(sheet_texts)
         except Exception:
             return file_bytes.decode("utf-8", errors="ignore")
@@ -222,7 +236,7 @@ def extract_excel_sheet_text(file_bytes: bytes, requested_sheet_name: str) -> st
     """Extract only the explicitly requested worksheet, matching its name exactly."""
     import openpyxl
 
-    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     target_name = " ".join(requested_sheet_name.casefold().split())
     actual_name = next(
         (
@@ -238,7 +252,7 @@ def extract_excel_sheet_text(file_bytes: bytes, requested_sheet_name: str) -> st
 
     worksheet = workbook[actual_name]
     lines = [f"[Sheet: {actual_name}]"]
-    for row in worksheet.iter_rows(values_only=True):
+    for row in worksheet.iter_rows(max_row=300, values_only=True):
         values = [str(cell) if cell is not None else "" for cell in row]
         if any(value.strip() for value in values):
             lines.append(" | ".join(values))

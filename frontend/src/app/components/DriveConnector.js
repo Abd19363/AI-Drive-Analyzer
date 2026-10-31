@@ -1,14 +1,16 @@
 "use client";
 
-import { HardDrive, ArrowRight, ShieldCheck, Sparkles, CheckCircle2, LogOut, Loader2 } from "lucide-react";
+import { HardDrive, ArrowRight, ShieldCheck, Sparkles, CheckCircle2, LogOut, Loader2, RefreshCw } from "lucide-react";
 
 export default function DriveConnector({
   isConnected,
   userEmail,
   onConnect,
   onDisconnect,
+  onReloadFiles,
   isLoading,
   isDisconnecting,
+  isReloading,
 }) {
   /* ── CONNECTED STATE ── */
   if (isConnected) {
@@ -31,18 +33,33 @@ export default function DriveConnector({
           </div>
         </div>
 
-        <button
-          onClick={onDisconnect}
-          disabled={isDisconnecting}
-          className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 hover:bg-rose-100 active:scale-[0.98] transition-all disabled:opacity-50 flex-shrink-0"
-        >
-          {isDisconnecting ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : (
-            <LogOut size={14} />
-          )}
-          {isDisconnecting ? "Disconnecting…" : "Disconnect Google Drive"}
-        </button>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <button
+            onClick={onReloadFiles}
+            disabled={isReloading || isDisconnecting}
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-700 bg-slate-50 border border-slate-200 hover:bg-slate-100 hover:border-slate-300 active:scale-[0.98] transition-all disabled:opacity-50 shadow-2xs"
+            title="Re-load Google Drive files"
+          >
+            <RefreshCw
+              size={13}
+              className={isReloading ? "animate-spin text-blue-600" : "text-slate-500"}
+            />
+            {isReloading ? "Reloading..." : "Re-load files"}
+          </button>
+
+          <button
+            onClick={onDisconnect}
+            disabled={isDisconnecting || isReloading}
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium text-rose-600 bg-rose-50 border border-rose-200 hover:bg-rose-100 active:scale-[0.98] transition-all disabled:opacity-50 flex-shrink-0"
+          >
+            {isDisconnecting ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <LogOut size={14} />
+            )}
+            {isDisconnecting ? "Disconnecting…" : "Disconnect Google Drive"}
+          </button>
+        </div>
       </div>
     );
   }
