@@ -17,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.models import DocumentChunk
-from app.services.extractor_service import chunk_text
+from app.services.extractor_service import (
+    PDF_OCR_PAGE_LIMIT,
+    _ocr_image_with_tesseract,
+    _ocr_pdf_page,
+    chunk_text,
+    ocr_image_with_gemini_vision,
+    pdf_page_needs_ocr,
+)
 from app.services.embedding_service import get_or_create_embeddings
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,10 @@ def _extract_query_tokens(query: str) -> List[str]:
     expanded_tokens = list(meaningful_tokens)
 
     for token in meaningful_tokens:
+        expanded_tokens.extend(
+            part for part in re.split(r"[-_.]+", token)
+            if len(part) >= 2 and part not in _STOPWORDS
+        )
         normalized = token.rstrip("s")
         normalized = _QUERY_TERM_ALIASES.get(normalized, normalized)
         if normalized != token:
@@ -299,6 +310,12 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
     Falls back to first pages if no exact keywords found.
     """
     candidate_sections = []
+    ocr_pages_done = 0
+    candidate_vision_pages_done = 0
+    candidate_party_query = (
+        any(term in keywords for term in ("candidate", "candidates", "contesting"))
+        and any(term in keywords for term in ("party", "parties", "affiliation"))
+    )
     try:
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -307,6 +324,31 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
 
         for page_idx, page in enumerate(doc):
             pt = (page.get_text() or "").strip()
+            if (
+                ocr_pages_done < PDF_OCR_PAGE_LIMIT
+                and pdf_page_needs_ocr(page, pt)
+            ):
+                ocr_pages_done += 1
+                ocr_text = _ocr_pdf_page(page)
+                if ocr_text:
+                    pt = "\n".join(part for part in (pt, ocr_text) if part)
+                if (
+                    candidate_party_query
+                    and candidate_vision_pages_done < 10
+                    and re.search(r"\b(?:candidate|candidates|party|affiliation)\b", pt, re.I)
+                ):
+                    candidate_vision_pages_done += 1
+                    pixmap = page.get_pixmap(dpi=300, alpha=False)
+                    vision_text = ocr_image_with_gemini_vision(
+                        pixmap.tobytes("png"),
+                        mime_type="image/png",
+                    )
+                    if vision_text:
+                        pt = "\n".join(
+                            part
+                            for part in ((page.get_text() or "").strip(), vision_text)
+                            if part
+                        )
             if pt:
                 all_pages.append(f"[Page {page_idx + 1}]\n{pt}")
                 if keywords and any(kw in pt.lower() for kw in keywords):
@@ -328,6 +370,16 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
         matched_pages = []
         for page_idx, page in enumerate(reader.pages):
             text = (page.extract_text() or "").strip()
+            if ocr_pages_done < PDF_OCR_PAGE_LIMIT:
+                page_images = getattr(page, "images", [])
+                if page_images:
+                    ocr_pages_done += 1
+                    for image in page_images:
+                        image_text = _ocr_image_with_tesseract(image.data)
+                        if len(image_text.split()) < 8:
+                            image_text = ocr_image_with_gemini_vision(image.data)
+                        if image_text:
+                            text = "\n".join(part for part in (text, image_text) if part)
             if text:
                 all_pages.append(f"[Page {page_idx + 1}]\n{text}")
                 if keywords and any(kw in text.lower() for kw in keywords):

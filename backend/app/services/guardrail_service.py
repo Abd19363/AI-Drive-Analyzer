@@ -1,6 +1,9 @@
 import re
 from typing import Dict, Any, Tuple
-from app.services.extractor_service import extract_content
+from app.services.extractor_service import (
+    extract_content,
+    refine_candidate_party_pdf_ocr,
+)
 
 # 1. Metadata Suspicious Patterns
 SENSITIVE_FILENAME_KEYWORDS = [
@@ -111,7 +114,14 @@ def evaluate_financial_heuristic(content: str) -> Tuple[bool, str, str]:
     
     return False, "", ""
 
-def run_guardrails(file_name: str, mime_type: str, file_bytes: bytes) -> Dict[str, Any]:
+def run_guardrails(
+    file_name: str,
+    mime_type: str,
+    file_bytes: bytes,
+    *,
+    allow_vision_fallback: bool = True,
+    candidate_party_query: bool = False,
+) -> Dict[str, Any]:
     """
     Full 4-Layer Guardrail Pipeline:
     1. Metadata Screening
@@ -132,8 +142,23 @@ def run_guardrails(file_name: str, mime_type: str, file_bytes: bytes) -> Dict[st
             "extracted_text": ""
         }
 
-    # Stage 2: Fast Content Extraction (disable heavy OCR during guardrail screening)
-    extracted_text = extract_content(file_bytes, mime_type, file_name, run_ocr_if_sparse=False)
+    # OCR must be included in privacy checks before any extracted text is indexed.
+    extracted_text = extract_content(
+        file_bytes,
+        mime_type,
+        file_name,
+        run_ocr_if_sparse=True,
+        allow_vision_fallback=allow_vision_fallback,
+    )
+    if candidate_party_query and (
+        file_bytes.startswith(b"%PDF")
+        or "pdf" in mime_type.lower()
+        or file_name.lower().endswith(".pdf")
+    ):
+        extracted_text = refine_candidate_party_pdf_ocr(
+            file_bytes,
+            extracted_text,
+        )
 
     # Stage 3: Regex & Custom Validators
     val_flagged, val_reason, val_type, snippet = inspect_content_with_validators(extracted_text)
@@ -213,4 +238,3 @@ def is_query_about_media(query: str) -> bool:
         if re.search(pattern, q_clean):
             return True
     return False
-

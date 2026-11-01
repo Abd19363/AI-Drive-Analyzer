@@ -61,6 +61,7 @@ class DriveFile(Base):
     guardrail_status = Column(String(50), default="UNCHECKED") # 'UNCHECKED', 'PASSED', 'FLAGGED_CONFIDENTIAL'
     confidentiality_reason = Column(Text, nullable=True)
     is_embedded = Column(Boolean, default=False)
+    extraction_version = Column(Integer, default=0, nullable=False)
     last_scanned_at = Column(TIMESTAMP(timezone=True), nullable=True)
     source_modified_time = Column(String(64), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)

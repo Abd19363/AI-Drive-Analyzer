@@ -58,6 +58,7 @@ The end-to-end journey for a user interacting with the platform:
 
 2. **Explore the Document Catalog:**
    - The catalog organizes Drive files into category tabs: **All Files**, **Docs**, **Sheets**, and **PDFs**, accompanied by live search.
+   - Folder contents are discovered recursively, including files nested inside subfolders, and are included in Drive searches.
    - **Selective Querying:** The user can select one or more checkboxes to target specific files (e.g., an exact spreadsheet or policy document).
    - **AI Auto-Discovery:** If the user leaves the file selection empty, the system automatically analyzes the query and selects the most relevant files across the entire Drive catalog.
 
@@ -72,7 +73,7 @@ The end-to-end journey for a user interacting with the platform:
 
 4. **Instant Cache Delivery vs. Live Analysis:**
    - **Cache Hit:** If an identical question (within the same file scope and user context) was recently asked, the system returns the verified answer **instantaneously (in milliseconds)** without re-reading or analyzing any files.
-   - **Live Analysis:** If the answer is not cached, the backend executes the deep RAG analysis pipeline.
+   - **Live Analysis:** If the answer is not cached, the backend executes the deep RAG analysis pipeline. Sparse or image-heavy PDF pages are OCRed with Tesseract before privacy screening and indexing, including pages with selectable scanner watermarks. For an explicitly selected PDF and a candidate/party list question, OCR text is screened, targeted pages receive a bounded visual OCR refinement, and the complete extracted text is supplied to answer generation without waiting for semantic embeddings. The live workflow is budgeted below 30 seconds; actual latency still depends on Drive and model services. Existing file indexes are refreshed when the extraction pipeline changes.
 
 5. **Review the Formatted Answer:**
    - The assistant outputs clear, descriptive, and structured answers formatted in modern Markdown:
@@ -213,9 +214,9 @@ When an answer is not cached, the compiled **LangGraph state machine (`rag_graph
 
 #### Step 3: On-Demand Extraction & Chunking (`node_embed_content`)
 - Safe candidate files are streamed on-demand from Google Drive.
-- Only the safe candidate files for the current query are extracted and embedded; the pipeline does not pre-embed the whole Drive.
+- Only the safe candidate files for the current query are extracted and indexed; the pipeline does not pre-embed the whole Drive. Selected candidate/party-list PDF queries store text-only chunks and skip semantic embedding so OCR text can reach answer generation promptly.
 - Multi-format text extraction:
-  - **PDF Documents:** Extracted using `pypdf`, backed by `fontTools` to parse embedded CFF Type1 fonts and non-standard character encodings.
+  - **PDF Documents:** Text is extracted using `pypdf`, backed by `fontTools` to parse embedded CFF Type1 fonts and non-standard character encodings. Sparse or image-heavy pages are OCRed locally with Tesseract; selected candidate-list queries can receive bounded visual OCR refinement.
   - **Excel Spreadsheets (`.xlsx`, `.xls`):** Parsed via `openpyxl`. If the user asked about a specific worksheet (e.g., `"Sales Data"`), the parser extracts only that worksheet.
   - **Word Documents (`.docx`):** Extracted via `python-docx` table and paragraph iterators.
   - **Plain Text / CSV:** Streamed and decoded directly.

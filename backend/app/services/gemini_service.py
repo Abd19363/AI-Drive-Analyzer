@@ -26,6 +26,56 @@ def get_gemini_client():
         raise ValueError("GEMINI_API_KEY is not configured in settings or .env")
     return genai.Client(api_key=settings.GEMINI_API_KEY)
 
+
+def _is_candidate_party_query(query: str, intent: str) -> bool:
+    return (
+        intent == "list"
+        and bool(re.search(r"\b(?:candidate|candidates|contesting|nominee|nominees)\b", query, re.I))
+        and bool(re.search(r"\b(?:party|parties|affiliation|affiliations)\b", query, re.I))
+    )
+
+
+def _validate_candidate_party_answer(
+    answer: str,
+    source_texts: List[str],
+) -> str:
+    source_chunks = [
+        re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        for text in source_texts
+    ]
+    rows = []
+    for line in answer.splitlines():
+        cells = [cell.strip().strip("*_` ") for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 2:
+            continue
+        candidate, affiliation = cells
+        candidate_normalized = re.sub(r"[^a-z0-9]+", " ", candidate.lower()).strip()
+        affiliation_normalized = re.sub(r"[^a-z0-9]+", " ", affiliation.lower()).strip()
+        if not candidate_normalized or not affiliation_normalized:
+            continue
+        if "candidate" in candidate_normalized and (
+            "party" in affiliation_normalized or "affiliation" in affiliation_normalized
+        ):
+            continue
+        rows.append((candidate_normalized, affiliation_normalized))
+
+    if rows and all(
+        any(
+            candidate in source and affiliation in source
+            for source in source_chunks
+        )
+        for candidate, affiliation in rows
+    ):
+        return answer
+
+    return (
+        "I couldn't verify an exact candidate-and-party list against the text "
+        "extracted from the selected document, so I won't guess. Please retry "
+        "after checking the PDF's OCR; if the scan is readable, the list should "
+        "be extracted from the document."
+    )
+
+
 # Error patterns that should not trigger model failover.
 _FATAL_PATTERNS = {"API_KEY_INVALID", "API KEY NOT VALID", "API_KEY_EXPIRED"}
 
@@ -107,7 +157,13 @@ User question: {query}"""
     response = await asyncio.to_thread(generate_content_with_fallback, client, prompt, config)
     if not response.text:
         raise RuntimeError("Gemini returned an empty response for the general question.")
-    return sanitize_confidential_output(response.text, query)
+    answer = response.text
+    if is_candidate_party_list:
+        answer = _validate_candidate_party_answer(
+            answer,
+            [chunk.get("chunk_text", "") for chunk in chunks_to_include],
+        )
+    return sanitize_confidential_output(answer, query)
 
 
 async def classify_general_vs_drive_query(
@@ -300,8 +356,10 @@ async def synthesize_answer(
     # Keep model input bounded to reduce latency and prevent oversized prompts.
     context_blocks = []
     is_structure_query = is_document_structure_query(query)
-    remaining_chars = 24000 if is_structure_query else 10000
-    chunks_to_include = retrieved_chunks if is_structure_query else retrieved_chunks[:8]
+    is_candidate_party_list = _is_candidate_party_query(query, intent)
+    exhaustive_list_query = is_structure_query or is_candidate_party_list
+    remaining_chars = 24000 if exhaustive_list_query else 10000
+    chunks_to_include = retrieved_chunks if exhaustive_list_query else retrieved_chunks[:8]
     for idx, chunk in enumerate(chunks_to_include):
         fname = chunk.get("file_name", "Unknown Document")
         text = chunk.get("chunk_text", "")
@@ -333,6 +391,15 @@ async def synthesize_answer(
         "general": "Respond in the format that best fits the user's request.",
     }
     answer_style = intent_instructions.get(intent, intent_instructions["general"])
+    if is_candidate_party_list:
+        answer_style = (
+            "Extract every contesting candidate and the party affiliation explicitly associated with that candidate "
+            "in the supplied document. Return only a table with Candidate and Party affiliation columns, followed "
+            "by the source filename. Do not add a constituency overview, election history, likely parties, or "
+            "outside knowledge. Do not infer a party from a candidate's name or from a party mentioned elsewhere. "
+            "If the supplied text does not show the candidate list or affiliations clearly, say that the list could "
+            "not be read from the selected document instead of guessing."
+        )
 
     confidential_notice = ""
     if skipped_confidential_files:
@@ -413,6 +480,7 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
   "Please ask query about textual files(other than images or video files)"
 - If the document contains code, schemas, or commands, format them in markdown code blocks.
 - If files were withheld for privacy, mention why briefly without using internal technical jargon.
+{"For this candidate-and-party list, include only explicitly paired names and affiliations present in the supplied document. Never substitute general political background or historically active parties for the requested list." if is_candidate_party_list else ""}
 """
 
     config = types.GenerateContentConfig(
@@ -427,9 +495,16 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
             timeout=12.0,
         )
     except asyncio.TimeoutError:
-        logger.warning("[Gemini] Synthesis hit 14s timeout; generating concise direct answer")
+        logger.warning("[Gemini] Synthesis hit 12s timeout; generating concise evidence-only answer")
         fast_config = types.GenerateContentConfig(temperature=0.2, max_output_tokens=512)
-        fast_prompt = f"Answer the user question '{query}' concisely in structured markdown based on this evidence:\n{context_str[:4000]}"
+        fast_prompt = (
+            "Answer using ONLY the document evidence below. Do not use outside knowledge, "
+            "add background, or infer missing facts. If evidence does not state the answer, "
+            "say that it is not shown in the supplied text.\n"
+            f"Question: {query}\n"
+            f"{'For this request, list every explicitly named contesting candidate and the party affiliation paired with that candidate. Return only a table; do not list historically active parties.' if is_candidate_party_list else ''}\n"
+            f"Document evidence:\n{context_str[:12000]}"
+        )
         response = await asyncio.to_thread(
             generate_content_with_fallback, client, fast_prompt, fast_config
         )

@@ -1,14 +1,87 @@
 import io
+import logging
+import os
+import re
+import shutil
+from pathlib import Path
 from PIL import Image
 import pytesseract
 from docx import Document
 from app.config import settings
 
-# Configure tesseract executable if needed
-if settings.TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_CMD
+logger = logging.getLogger(__name__)
+DOCUMENT_EXTRACTION_VERSION = 4
+PDF_OCR_PAGE_LIMIT = 100
+PDF_IMAGE_COVERAGE_THRESHOLD = 0.35
+PDF_OCR_DPI = 150
 
-def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+if settings.TESSERACT_CMD:
+    configured_tesseract = shutil.which(settings.TESSERACT_CMD)
+    if not configured_tesseract and Path(settings.TESSERACT_CMD).is_file():
+        configured_tesseract = settings.TESSERACT_CMD
+    if (
+        not configured_tesseract
+        and os.name == "nt"
+        and Path(settings.TESSERACT_CMD).name.lower() == "tesseract"
+    ):
+        default_tesseract = (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Tesseract-OCR"
+            / "tesseract.exe"
+        )
+        if default_tesseract.is_file():
+            configured_tesseract = str(default_tesseract)
+    pytesseract.pytesseract.tesseract_cmd = (
+        configured_tesseract or settings.TESSERACT_CMD
+    )
+
+
+def _ocr_image_with_tesseract(image_bytes: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            return pytesseract.image_to_string(image).strip()
+    except Exception as exc:
+        logger.warning("Local Tesseract OCR failed: %s", exc)
+        return ""
+
+
+def _ocr_pdf_page(page, allow_vision_fallback: bool = True) -> str:
+    pixmap = page.get_pixmap(dpi=PDF_OCR_DPI, alpha=False)
+    image_bytes = pixmap.tobytes("png")
+    text = _ocr_image_with_tesseract(image_bytes)
+    if len(text.split()) >= 8:
+        return text
+    if allow_vision_fallback:
+        return ocr_image_with_gemini_vision(image_bytes, mime_type="image/png")
+    return text
+
+
+def pdf_page_needs_ocr(page, extracted_text: str) -> bool:
+    if len(extracted_text.strip()) < 40:
+        return True
+
+    page_area = page.rect.width * page.rect.height
+    if page_area <= 0:
+        return False
+
+    image_area = 0.0
+    for image_info in page.get_image_info():
+        x0, y0, x1, y1 = image_info["bbox"]
+        width = max(0.0, min(x1, page.rect.x1) - max(x0, page.rect.x0))
+        height = max(0.0, min(y1, page.rect.y1) - max(y0, page.rect.y0))
+        image_area += width * height
+        if image_area / page_area >= PDF_IMAGE_COVERAGE_THRESHOLD:
+            return True
+    return False
+
+
+def ocr_image_with_gemini_vision(
+    img_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    *,
+    max_models: int = 3,
+    timeout_seconds: float = 3.5,
+) -> str:
     """
     Transcribes text from a scanned document image using Gemini Vision.
     Uses fast flash models with bounded execution.
@@ -36,25 +109,113 @@ def ocr_image_with_gemini_vision(img_bytes: bytes, mime_type: str = "image/jpeg"
                 config=types.GenerateContentConfig(max_output_tokens=1024, temperature=0.1),
             )
 
-        for model_name in unique_models:
+        for model_name in unique_models[:max_models]:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(_call_vision, model_name)
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(_call_vision, model_name)
-                    resp = future.result(timeout=3.5)
-                    if resp and resp.text:
-                        return resp.text.strip()
+                resp = future.result(timeout=timeout_seconds)
+                if resp and resp.text:
+                    return resp.text.strip()
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "Gemini Vision OCR timed out for model %s",
+                    model_name,
+                )
+                break
             except Exception:
                 continue
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
         return ""
     except Exception as e:
         print(f"[OCR Vision Error]: {e}")
         return ""
 
-def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_ocr_pages: int = 1) -> str:
+
+def refine_candidate_party_pdf_ocr(
+    pdf_bytes: bytes,
+    extracted_text: str,
+    *,
+    max_pages: int = 2,
+) -> str:
+    page_blocks = re.findall(
+        r"\[Page\s+(\d+)\]\s*(.*?)(?=\n\[Page\s+\d+\]|\Z)",
+        extracted_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not page_blocks:
+        return extracted_text
+
+    candidate_pages = []
+    for page_number, page_text in page_blocks:
+        if re.search(
+            r"\b(?:candidate|candidates|contesting|nominee|nominees|party|"
+            r"affiliation|NA[\s-]*61)\b",
+            page_text,
+            flags=re.IGNORECASE,
+        ):
+            candidate_pages.append(int(page_number) - 1)
+
+    if not candidate_pages:
+        candidate_pages = [
+            int(page_number) - 1
+            for page_number, _ in page_blocks[:max_pages]
+        ]
+
+    selected_pages = set(candidate_pages[:max_pages])
+    if len(selected_pages) < max_pages:
+        for page_index in candidate_pages[:max_pages]:
+            next_page = page_index + 1
+            if next_page < PDF_OCR_PAGE_LIMIT:
+                selected_pages.add(next_page)
+                if len(selected_pages) >= max_pages:
+                    break
+
+    try:
+        import fitz
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_index in sorted(selected_pages):
+            if page_index >= len(document):
+                continue
+            page_image = document[page_index].get_pixmap(
+                dpi=220,
+                alpha=False,
+            ).tobytes("png")
+            visual_text = ocr_image_with_gemini_vision(
+                page_image,
+                mime_type="image/png",
+                max_models=1,
+                timeout_seconds=2.5,
+            )
+            if visual_text:
+                page_number = page_index + 1
+                extracted_text = re.sub(
+                    rf"(\[Page\s+{page_number}\]\s*)(.*?)(?=\n\[Page\s+\d+\]|\Z)",
+                    lambda match: (
+                        f"{match.group(1)}{match.group(2).rstrip()}\n"
+                        f"[Visual transcription]\n{visual_text}"
+                    ),
+                    extracted_text,
+                    count=1,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+        document.close()
+    except Exception as exc:
+        logger.warning("Candidate-list page OCR refinement failed: %s", exc)
+
+    return extracted_text
+
+
+def extract_text_from_pdf(
+    pdf_bytes: bytes,
+    run_ocr_if_sparse: bool = True,
+    max_ocr_pages: int = PDF_OCR_PAGE_LIMIT,
+    allow_vision_fallback: bool = True,
+) -> str:
     """
     Extracts text from PDF bytes using PyMuPDF (fitz) or pypdf.
-    If pages contain scanned images and sparse text, optionally runs Gemini Vision OCR
-    up to a capped number of pages (max_ocr_pages) to keep response times fast.
+    Sparse pages are OCRed locally with Tesseract first, with Gemini Vision as
+    a fallback, up to max_ocr_pages.
     """
     if not pdf_bytes:
         return ""
@@ -68,16 +229,23 @@ def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page_idx, page in enumerate(doc):
             pt = (page.get_text() or "").strip()
-            if len(pt) < 40 and run_ocr_if_sparse and ocr_pages_done < max_ocr_pages:
+            if (
+                run_ocr_if_sparse
+                and ocr_pages_done < max_ocr_pages
+                and pdf_page_needs_ocr(page, pt)
+            ):
                 try:
-                    pix = page.get_pixmap(dpi=150)
-                    img_bytes = pix.tobytes("jpeg")
-                    ocr_res = ocr_image_with_gemini_vision(img_bytes)
+                    ocr_pages_done += 1
+                    ocr_res = _ocr_pdf_page(
+                        page,
+                        allow_vision_fallback=allow_vision_fallback,
+                    )
                     if ocr_res:
                         pt = (pt + "\n" + ocr_res).strip()
-                        ocr_pages_done += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "PDF OCR failed on page %s: %s", page_idx + 1, exc
+                    )
             if pt:
                 extracted_pages.append(f"[Page {page_idx + 1}]\n{pt}")
         doc.close()
@@ -98,19 +266,29 @@ def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_
                     warnings.filterwarnings("ignore", category=UserWarning, message=".*fontTools.*")
                     page_text = (page.extract_text() or "").strip()
 
-                # If page text is sparse/scanned, inspect page images and run OCR (up to max_ocr_pages)
-                if len(page_text) < 40 and run_ocr_if_sparse and ocr_pages_done < max_ocr_pages:
+                # OCR embedded scans even when the page also has selectable watermark text.
+                if run_ocr_if_sparse and ocr_pages_done < max_ocr_pages:
                     page_imgs = getattr(page, "images", [])
                     if page_imgs:
+                        ocr_pages_done += 1
+                        image_texts = []
                         for img in page_imgs:
                             try:
-                                ocr_res = ocr_image_with_gemini_vision(img.data)
+                                ocr_res = _ocr_image_with_tesseract(img.data)
+                                if len(ocr_res.split()) < 8 and allow_vision_fallback:
+                                    ocr_res = ocr_image_with_gemini_vision(img.data)
                                 if ocr_res:
-                                    page_text = (page_text + "\n" + ocr_res).strip()
-                                    ocr_pages_done += 1
-                                    break  # Primary page image transcribed
+                                    image_texts.append(ocr_res)
                             except Exception as e:
-                                print(f"[pypdf OCR error on page {page_idx+1}]: {e}")
+                                logger.warning(
+                                    "PDF image OCR failed on page %s: %s",
+                                    page_idx + 1,
+                                    e,
+                                )
+                        if image_texts:
+                            page_text = "\n".join(
+                                part for part in (page_text, *image_texts) if part
+                            )
 
                 if page_text:
                     extracted_pages.append(f"[Page {page_idx + 1}]\n{page_text}")
@@ -123,16 +301,10 @@ def extract_text_from_pdf(pdf_bytes: bytes, run_ocr_if_sparse: bool = True, max_
     return ""
 
 def extract_text_from_image(image_bytes: bytes) -> str:
-    # 1. Try local pytesseract first
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        ocr_text = pytesseract.image_to_string(img).strip()
-        if ocr_text:
-            return ocr_text
-    except Exception:
-        pass
+    ocr_text = _ocr_image_with_tesseract(image_bytes)
+    if ocr_text:
+        return ocr_text
 
-    # 2. Fallback to Gemini Vision OCR
     try:
         vision_text = ocr_image_with_gemini_vision(image_bytes)
         if vision_text:
@@ -175,7 +347,13 @@ def extract_text_from_pptx(pptx_bytes: bytes) -> str:
         except Exception:
             return f"[Presentation extraction error: {e}]"
 
-def extract_content(file_bytes: bytes, mime_type: str, file_name: str, run_ocr_if_sparse: bool = True) -> str:
+def extract_content(
+    file_bytes: bytes,
+    mime_type: str,
+    file_name: str,
+    run_ocr_if_sparse: bool = True,
+    allow_vision_fallback: bool = True,
+) -> str:
     if not file_bytes:
         return ""
 
@@ -188,7 +366,11 @@ def extract_content(file_bytes: bytes, mime_type: str, file_name: str, run_ocr_i
         or name_lower.endswith(".pdf")
         or mime_type in ("application/vnd.google-apps.document", "application/vnd.google-apps.presentation")
     ):
-        return extract_text_from_pdf(file_bytes, run_ocr_if_sparse=run_ocr_if_sparse)
+        return extract_text_from_pdf(
+            file_bytes,
+            run_ocr_if_sparse=run_ocr_if_sparse,
+            allow_vision_fallback=allow_vision_fallback,
+        )
     elif "image" in mime_type or any(name_lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
         if not run_ocr_if_sparse:
             return ""

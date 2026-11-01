@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import DriveFile, QueryAnswerCache
+from app.services.extractor_service import DOCUMENT_EXTRACTION_VERSION
 from app.services.query_intent_service import (
     implicit_sheet_name_candidate,
     requested_sheet_name,
@@ -109,6 +110,7 @@ async def _document_versions_are_current(
             select(
                 DriveFile.file_id,
                 DriveFile.source_modified_time,
+                DriveFile.extraction_version,
                 DriveFile.guardrail_status,
                 DriveFile.is_embedded,
             ).where(
@@ -122,7 +124,7 @@ async def _document_versions_are_current(
             "The answer cache could not validate its source documents."
         ) from exc
     current_versions = {
-        row[0]: (row[1], row[2], row[3])
+        row[0]: (row[1], row[2], row[3], row[4])
         for row in result.all()
     }
     if len(current_versions) != len(set(file_ids)):
@@ -131,11 +133,16 @@ async def _document_versions_are_current(
     cached_versions = entry.document_versions or {}
     for file_id in file_ids:
         current = current_versions.get(file_id)
-        if not current or current[0] != cached_versions.get(file_id):
+        expected_version = (
+            f"{current[0]}|extract:{current[1]}" if current else None
+        )
+        if not current or expected_version != cached_versions.get(file_id):
             return False
-        if current[1] != "PASSED":
+        if current[1] != DOCUMENT_EXTRACTION_VERSION:
             return False
-        if entry.answer_kind == "document" and not current[2]:
+        if current[2] != "PASSED":
+            return False
+        if entry.answer_kind == "document" and not current[3]:
             return False
     return True
 
@@ -177,6 +184,10 @@ async def lookup_cached_answer(
     allowed_kinds = _cache_kinds(intent, allow_general_answer)
     for entry in result.scalars().all():
         if entry.answer_kind not in allowed_kinds:
+            continue
+        # A previous "not found" result is not reliable enough to short-circuit
+        # a new search of files the user explicitly selected.
+        if entry.answer_kind == "insufficient" and selected_file_ids:
             continue
         if entry.expires_at <= now or not entry.is_complete or not entry.is_safe:
             continue

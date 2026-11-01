@@ -2,6 +2,7 @@ import io
 import logging
 import threading
 import time
+from typing import Optional
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -11,6 +12,10 @@ from app.models import GoogleAccount
 logger = logging.getLogger(__name__)
 _file_catalog_cache = {}
 _file_catalog_cache_lock = threading.Lock()
+_FILE_FIELDS = (
+    "nextPageToken, files(id, name, mimeType, size, webViewLink, "
+    "createdTime, modifiedTime, parents)"
+)
 
 
 def get_drive_service(google_account: GoogleAccount):
@@ -24,6 +29,33 @@ def get_drive_service(google_account: GoogleAccount):
     )
     return build("drive", "v3", credentials=credentials)
 
+
+def _list_files_pagewise(
+    service,
+    query: str,
+    page_size: int,
+    order_by: Optional[str] = None,
+):
+    files = []
+    page_token = None
+    while True:
+        params = {
+            "q": query,
+            "pageSize": page_size,
+            "fields": _FILE_FIELDS,
+        }
+        if order_by:
+            params["orderBy"] = order_by
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = service.files().list(**params).execute()
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return files
+
+
 def list_files(
     google_account: GoogleAccount,
     page_size: int = 100,
@@ -35,13 +67,12 @@ def list_files(
     if q:
         query += f" and ({q})"
         
-    results = service.files().list(
-        q=query,
-        pageSize=page_size,
-        fields="nextPageToken, files(id, name, mimeType, size, webViewLink, createdTime, modifiedTime, parents)",
-        orderBy="modifiedTime desc"
-    ).execute()
-    top_items = results.get("files", [])
+    top_items = _list_files_pagewise(
+        service,
+        query,
+        page_size,
+        order_by="modifiedTime desc",
+    )
 
     all_files = []
     seen_ids = set()
@@ -58,51 +89,67 @@ def list_files(
         if item.get("mimeType") == "application/vnd.google-apps.folder":
             folder_items.append(item)
 
-    # Discover files inside folders concurrently to avoid sequential network delays
+    # Expand every folder level so nested files are available to search and display.
     if expand_folders and folder_items:
         from concurrent.futures import ThreadPoolExecutor
 
         def fetch_folder_children(folder_item):
             try:
-                fid = folder_item.get("id")
-                fname = folder_item.get("name")
-                thread_svc = get_drive_service(google_account)
-                children_res = thread_svc.files().list(
-                    q=f"'{fid}' in parents and trashed = false",
-                    fields="files(id, name, mimeType, size, webViewLink, createdTime, modifiedTime, parents)",
-                    pageSize=100
-                ).execute()
-                children = children_res.get("files", [])
+                folder_id = folder_item.get("id")
+                thread_service = get_drive_service(google_account)
+                children = _list_files_pagewise(
+                    thread_service,
+                    f"'{folder_id}' in parents and trashed = false",
+                    page_size,
+                    order_by="folder, modifiedTime desc",
+                )
+                folder_path = (
+                    folder_item.get("folder_path")
+                    or folder_item.get("name", "")
+                )
                 for child in children:
-                    child["folder_name"] = fname
-                    child["parent_id"] = fid
-                    child["is_folder"] = child.get("mimeType") == "application/vnd.google-apps.folder"
+                    child["folder_name"] = folder_item.get("name")
+                    child["folder_path"] = folder_path
+                    child["parent_id"] = folder_id
+                    child["is_folder"] = (
+                        child.get("mimeType")
+                        == "application/vnd.google-apps.folder"
+                    )
                 return children
-            except Exception as e:
-                logger.warning(f"[DRIVE] Error expanding folder {folder_item.get('name')}: {e}")
-                return []
+            except Exception as exc:
+                logger.exception(
+                    "[DRIVE] Failed to list children of folder %s",
+                    folder_item.get("name"),
+                )
+                raise RuntimeError(
+                    f"Failed to list children of Drive folder "
+                    f"{folder_item.get('name', folder_item.get('id'))!r}."
+                ) from exc
 
+        pending_folders = list(folder_items)
+        visited_folder_ids = set()
         with ThreadPoolExecutor(max_workers=6) as executor:
-            level1_results = list(executor.map(fetch_folder_children, folder_items))
-            subfolder_items = []
-            for child_list in level1_results:
-                for child in child_list:
-                    cid = child.get("id")
-                    if cid and cid not in seen_ids:
-                        seen_ids.add(cid)
-                        all_files.append(child)
-                    if child.get("mimeType") == "application/vnd.google-apps.folder":
-                        subfolder_items.append(child)
+            while pending_folders:
+                current_folders = []
+                for folder in pending_folders:
+                    folder_id = folder.get("id")
+                    if folder_id and folder_id not in visited_folder_ids:
+                        visited_folder_ids.add(folder_id)
+                        current_folders.append(folder)
+                pending_folders = []
 
-            # Expand sub-folders one level deeper if any exist
-            if subfolder_items:
-                level2_results = list(executor.map(fetch_folder_children, subfolder_items))
-                for child_list in level2_results:
-                    for child in child_list:
-                        cid = child.get("id")
-                        if cid and cid not in seen_ids:
-                            seen_ids.add(cid)
+                child_groups = executor.map(
+                    fetch_folder_children,
+                    current_folders,
+                )
+                for children in child_groups:
+                    for child in children:
+                        child_id = child.get("id")
+                        if child_id and child_id not in seen_ids:
+                            seen_ids.add(child_id)
                             all_files.append(child)
+                        if child.get("is_folder"):
+                            pending_folders.append(child)
 
     return all_files
 
@@ -110,13 +157,12 @@ def list_files(
 def get_folder_children(google_account: GoogleAccount, folder_id: str):
     """Fetch direct children (files and sub-folders) of a specific folder on demand."""
     service = get_drive_service(google_account)
-    results = service.files().list(
-        q=f"'{folder_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType, size, webViewLink, createdTime, modifiedTime, parents)",
-        pageSize=100,
-        orderBy="folder, modifiedTime desc"
-    ).execute()
-    children = results.get("files", [])
+    children = _list_files_pagewise(
+        service,
+        f"'{folder_id}' in parents and trashed = false",
+        100,
+        order_by="folder, modifiedTime desc",
+    )
     for c in children:
         c["parent_id"] = folder_id
         c["is_folder"] = c.get("mimeType") == "application/vnd.google-apps.folder"

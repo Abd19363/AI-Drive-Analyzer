@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete, text
 from app.models import DriveFile, GuardrailLog, DocumentChunk, ChatQuery
-from app.services.drive_service import download_file, get_folder_children
+from app.services.drive_service import download_file
 from app.services.guardrail_service import (
     run_guardrails,
     screen_metadata,
@@ -16,9 +16,17 @@ from app.services.guardrail_service import (
     is_query_about_media,
     MEDIA_QUERY_RESPONSE,
 )
-from app.services.extractor_service import chunk_text, extract_excel_sheet_text
+from app.services.extractor_service import (
+    DOCUMENT_EXTRACTION_VERSION,
+    chunk_text,
+    extract_excel_sheet_text,
+)
 from app.services.embedding_service import get_or_create_embeddings, embed_single_query
-from app.services.gemini_service import analyze_query_for_drive_files, synthesize_answer
+from app.services.gemini_service import (
+    _is_candidate_party_query,
+    analyze_query_for_drive_files,
+    synthesize_answer,
+)
 from app.services.query_adaptive_service import (
     adaptive_embed_for_query,
     adaptive_embed_pdf_for_query,  # kept for backward compat
@@ -109,42 +117,52 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
             candidate_files = [f for f in candidate_files if not is_media_file(f)]
             logger.info(f"[RAG] Auto-discovery identified {len(candidate_files)} candidate file(s): {[f.get('name') for f in candidate_files]}")
 
-    # Expand any candidate folders into their actual document files
+    # Expand candidate folders into all descendant documents from the catalog.
     expanded = []
+    expanded_folder = False
+    catalog_by_parent = {}
+    for file_info in available_files:
+        parent_id = file_info.get("parent_id")
+        if parent_id:
+            catalog_by_parent.setdefault(parent_id, []).append(file_info)
+
     for cfile in candidate_files:
         if cfile.get("mimeType") == "application/vnd.google-apps.folder":
             folder_id = cfile.get("id")
-            children = []
-            if folder_id:
-                children = await asyncio.to_thread(
-                    get_folder_children,
-                    state["google_account"],
-                    folder_id,
-                )
-                for child in children:
-                    child["folder_name"] = cfile.get("name")
-                children = [
-                    child for child in children
-                    if child.get("mimeType") != "application/vnd.google-apps.folder"
-                    and not is_media_file(child)
-                ]
-            if children:
-                # Rank children inside the folder by relevance to query
-                ranked_children = match_files_by_title(query, children)
-                if ranked_children:
-                    expanded.extend(ranked_children[:2])
-                else:
-                    expanded.extend(children[:2])
-            else:
+            if not folder_id:
                 expanded.append(cfile)
+                continue
+
+            expanded_folder = True
+            descendant_files = []
+            pending_folder_ids = [folder_id]
+            visited_folder_ids = set()
+            while pending_folder_ids:
+                current_folder_id = pending_folder_ids.pop()
+                if current_folder_id in visited_folder_ids:
+                    continue
+                visited_folder_ids.add(current_folder_id)
+                for child in catalog_by_parent.get(current_folder_id, []):
+                    if child.get("mimeType") == "application/vnd.google-apps.folder":
+                        pending_folder_ids.append(child.get("id"))
+                    elif not is_media_file(child):
+                        descendant_files.append(child)
+
+            if descendant_files:
+                expanded.extend(descendant_files)
+            else:
+                logger.warning(
+                    "[RAG] No catalog descendants found for candidate folder %s",
+                    cfile.get("name"),
+                )
         else:
             if not is_media_file(cfile):
                 expanded.append(cfile)
 
     seen = set()
     unique_candidates = [f for f in expanded if f.get("id") not in seen and not seen.add(f.get("id"))]
-    # Cap candidate files to at most 1 for auto-discovery to keep processing fast and only embed the queried file
-    max_cands = 3 if selected_file_ids else 1
+    # A matched folder represents the search scope, so retain every descendant file.
+    max_cands = len(unique_candidates) if expanded_folder else (3 if selected_file_ids else 1)
     return {"candidate_files": unique_candidates[:max_cands], "auto_discovered": auto_discovered, "is_media_query": False}
 
 async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
@@ -159,6 +177,12 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
     google_account = state["google_account"]
     user_id = state["user_id"]
     candidate_files = state["candidate_files"]
+    query = state["query"]
+    intent = state.get("intent", "general")
+    selected_candidate_party_list = (
+        bool(state.get("selected_file_ids"))
+        and _is_candidate_party_query(query, intent)
+    )
 
     safe_files = []
     confidential_files = []
@@ -236,6 +260,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
         is_unchanged = (
             source_modified_time is not None
             and db_file.source_modified_time == source_modified_time
+            and db_file.extraction_version == DOCUMENT_EXTRACTION_VERSION
         )
 
         # Reuse the previous scan and index only while Drive says the source is unchanged.
@@ -256,9 +281,11 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "db_id": db_file.id,
                 "file_id": file_id,
                 "name": file_name,
+                "mime_type": db_file.mime_type,
                 "extracted_text": "",
                 "is_embedded": True,
                 "source_modified_time": db_file.source_modified_time,
+                "extraction_version": db_file.extraction_version,
             })
             continue
 
@@ -305,6 +332,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 file_info["file_name"],
                 file_info["mime_type"],
                 file_bytes,
+                allow_vision_fallback=not selected_candidate_party_list,
+                candidate_party_query=selected_candidate_party_list,
             )
             return file_info, guard_result, None, file_bytes
 
@@ -327,6 +356,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
 
         db_file.source_modified_time = file_info["source_modified_time"]
         db_file.last_scanned_at = datetime.now(timezone.utc)
+        db_file.extraction_version = DOCUMENT_EXTRACTION_VERSION
 
         if guard_result["is_confidential"]:
             db_file.guardrail_status = "FLAGGED_CONFIDENTIAL"
@@ -356,6 +386,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 "extracted_text": guard_result.get("extracted_text", ""),
                 "is_embedded": db_file.is_embedded,
                 "source_modified_time": db_file.source_modified_time,
+                "extraction_version": db_file.extraction_version,
             })
 
     await db.commit()
@@ -379,6 +410,13 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
     safe_files = state["safe_files"]
     chunks_to_store = []
     indexed_file_ids = set()
+    selected_candidate_party_list = (
+        bool(state.get("selected_file_ids"))
+        and _is_candidate_party_query(
+            state.get("query", ""),
+            state.get("intent", "general"),
+        )
+    )
 
     for sfile in safe_files:
         if sfile.get("is_embedded"):
@@ -418,6 +456,30 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
         if not chunks:
             continue
 
+        if (
+            selected_candidate_party_list
+            and (
+                "pdf" in (sfile.get("mime_type") or "").lower()
+                or (sfile.get("name") or "").lower().endswith(".pdf")
+            )
+        ):
+            indexed_file_ids.add(sfile["db_id"])
+            for idx, chunk_value in enumerate(chunks):
+                db.add(DocumentChunk(
+                    file_id=sfile["db_id"],
+                    user_id=user_id,
+                    chunk_index=idx,
+                    chunk_text=chunk_value.replace("\x00", ""),
+                    embedding=None,
+                    token_count=len(chunk_value.split()),
+                    metadata_={
+                        "file_name": sfile["name"],
+                        "file_id": sfile["file_id"],
+                        "text_only": True,
+                    },
+                ))
+            continue
+
         # Cap on-demand chunk indexing to at most 35 chunks per file to guarantee <= 1s embedding time
         capped_chunks = chunks[:35]
         indexed_file_ids.add(sfile["db_id"])
@@ -426,33 +488,32 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
             for idx, chunk_str in enumerate(capped_chunks)
         )
 
-    if not chunks_to_store:
-        return {}
+    if chunks_to_store:
+        embeddings = await get_or_create_embeddings(
+            [chunk for _, _, chunk in chunks_to_store],
+            db,
+        )
 
-    embeddings = await get_or_create_embeddings(
-        [chunk for _, _, chunk in chunks_to_store],
-        db,
-    )
+        for (sfile, idx, chunk_str), emb in zip(chunks_to_store, embeddings):
+            clean_chunk = chunk_str.replace("\x00", "")
+            db.add(DocumentChunk(
+                file_id=sfile["db_id"],
+                user_id=user_id,
+                chunk_index=idx,
+                chunk_text=clean_chunk,
+                embedding=emb,
+                token_count=len(clean_chunk.split()),
+                metadata_={"file_name": sfile["name"], "file_id": sfile["file_id"]}
+            ))
 
-    for (sfile, idx, chunk_str), emb in zip(chunks_to_store, embeddings):
-        clean_chunk = chunk_str.replace("\x00", "")
-        db.add(DocumentChunk(
-            file_id=sfile["db_id"],
-            user_id=user_id,
-            chunk_index=idx,
-            chunk_text=clean_chunk,
-            embedding=emb,
-            token_count=len(clean_chunk.split()),
-            metadata_={"file_name": sfile["name"], "file_id": sfile["file_id"]}
-        ))
+    if indexed_file_ids:
+        result = await db.execute(
+            select(DriveFile).where(DriveFile.id.in_(indexed_file_ids))
+        )
+        for db_file in result.scalars().all():
+            db_file.is_embedded = True
 
-    result = await db.execute(
-        select(DriveFile).where(DriveFile.id.in_(indexed_file_ids))
-    )
-    for db_file in result.scalars().all():
-        db_file.is_embedded = True
-
-    await db.commit()
+        await db.commit()
     return {}
 
 async def _get_query_embedding(
@@ -481,10 +542,11 @@ async def _run_vector_search(
     sql = text("""
         SELECT dc.chunk_text, df.name as file_name,
                1 - (dc.embedding <=> :qvec) as similarity,
-               df.file_id, df.source_modified_time
+               df.file_id, df.source_modified_time, df.extraction_version
         FROM document_chunks dc
         JOIN drive_files df ON dc.file_id = df.id
         WHERE dc.file_id = ANY(:file_ids)
+          AND dc.embedding IS NOT NULL
         ORDER BY dc.embedding <=> :qvec
         LIMIT :lim;
     """)
@@ -496,6 +558,7 @@ async def _run_vector_search(
             "similarity": float(row[2]),
             "file_id": row[3],
             "source_modified_time": row[4],
+            "extraction_version": row[5],
         }
         for row in result
     ]
@@ -528,7 +591,7 @@ async def _run_filename_and_title_search(
     sql = text("""
         SELECT dc.chunk_text, df.name as file_name,
                0.90 as similarity,
-               df.file_id, df.source_modified_time
+               df.file_id, df.source_modified_time, df.extraction_version
         FROM document_chunks dc
         JOIN drive_files df ON dc.file_id = df.id
         WHERE dc.file_id = ANY(:matched_ids)
@@ -543,6 +606,7 @@ async def _run_filename_and_title_search(
             "similarity": float(row[2]),
             "file_id": row[3],
             "source_modified_time": row[4],
+            "extraction_version": row[5],
             "filename_matched": True,
         }
         for row in chunk_res
@@ -561,6 +625,7 @@ async def search_cached_user_documents(
         DriveFile.user_id == user_id,
         DriveFile.guardrail_status == "PASSED",
         DriveFile.is_embedded.is_(True),
+        DriveFile.extraction_version == DOCUMENT_EXTRACTION_VERSION,
     )
     if selected_file_ids:
         statement = statement.where(DriveFile.file_id.in_(selected_file_ids))
@@ -577,6 +642,7 @@ async def search_cached_user_documents(
                 DriveFile.name,
                 DriveFile.file_id,
                 DriveFile.source_modified_time,
+                DriveFile.extraction_version,
             )
             .join(DriveFile, DocumentChunk.file_id == DriveFile.id)
             .where(
@@ -584,6 +650,7 @@ async def search_cached_user_documents(
                 DriveFile.user_id == user_id,
                 DriveFile.guardrail_status == "PASSED",
                 DriveFile.is_embedded.is_(True),
+                DriveFile.extraction_version == DOCUMENT_EXTRACTION_VERSION,
             )
             .order_by(DriveFile.name, DocumentChunk.chunk_index)
         )
@@ -595,6 +662,7 @@ async def search_cached_user_documents(
                 "similarity": 1.0,
                 "file_id": row[2],
                 "source_modified_time": row[3],
+                "extraction_version": row[4],
             }
             for row in chunks_result
         ]
@@ -751,6 +819,9 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
                     "source_modified_time": safe_file.get(
                         "source_modified_time"
                     ),
+                    "extraction_version": safe_file.get(
+                        "extraction_version", 0
+                    ),
                     "sheet_name": sheet_candidate,
                 })
 
@@ -796,6 +867,33 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
 
     safe_db_ids = [s["db_id"] for s in safe_files]
     retrieval_query = expand_query_for_retrieval(query)
+    selected_pdf_list_query = (
+        not state.get("auto_discovered")
+        and _is_candidate_party_query(query, state.get("intent", "general"))
+        and any(
+            "pdf" in (sfile.get("mime_type") or "").lower()
+            or (sfile.get("name") or "").lower().endswith(".pdf")
+            for sfile in safe_files
+        )
+    )
+
+    if selected_pdf_list_query:
+        full_doc_texts = await _get_full_document_texts(db, safe_db_ids)
+        retrieved_chunks = []
+        for safe_file in safe_files:
+            file_text = safe_file.get("extracted_text", "")
+            if not file_text:
+                file_text = full_doc_texts.get(safe_file.get("name", ""), "")
+            if file_text:
+                retrieved_chunks.append({
+                    "chunk_text": file_text,
+                    "file_name": safe_file.get("name", "Document"),
+                    "file_id": safe_file.get("file_id"),
+                    "source_modified_time": safe_file.get("source_modified_time"),
+                    "extraction_version": safe_file.get("extraction_version"),
+                    "similarity": 1.0,
+                })
+        return {"retrieved_chunks": retrieved_chunks}
 
     # ── ⓪ Full-document shortcut for small/medium files ──────────────────
     # If the total text of all selected files is small enough, skip vector
@@ -803,11 +901,10 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
     FULL_DOC_CHAR_LIMIT = 12000
     full_doc_texts = await _get_full_document_texts(db, safe_db_ids)
     total_chars = sum(len(t) for t in full_doc_texts.values())
-
     if total_chars > 0 and (
         total_chars <= FULL_DOC_CHAR_LIMIT
         or is_document_structure_query(query)
-    ):
+    ) and not selected_pdf_list_query:
         logger.info(
             f"[RAG] Full-document shortcut: {len(full_doc_texts)} file(s), "
             f"{total_chars} total chars — sending complete text to LLM."
@@ -850,16 +947,27 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
         f"top sim={max((c['similarity'] for c in retrieved), default=0):.3f}"
     )
 
-    # ── ③ Adaptive extraction if still insufficient ──────────────────────
-    # Only run heavy adaptive sectioning if the user explicitly selected files and evidence is weak.
+    # ── ③ Adaptive extraction if evidence may be incomplete ───────────────
+    # Selected PDF list requests need targeted extraction even if watermark
+    # text or a high semantic score makes the initial index look relevant.
     top_sim = max((c.get("similarity", 0) for c in retrieved), default=0)
     top_kw = max((c.get("keyword_score", 0) for c in retrieved), default=0)
     has_strong_evidence = top_sim >= 0.28 or top_kw >= 2 or any(c.get("filename_matched") for c in retrieved)
 
-    if not state.get("auto_discovered") and not has_strong_evidence and needs_adaptive_embedding(retrieved, retrieval_query):
+    if (
+        not state.get("auto_discovered")
+        and (
+            selected_pdf_list_query
+            or (
+                not has_strong_evidence
+                and needs_adaptive_embedding(retrieved, retrieval_query)
+            )
+        )
+    ):
         logger.info(
             "[RAG] Results insufficient for selected file(s) — triggering adaptive extraction."
         )
+        adaptive_chunks = []
         for sfile in safe_files:
             file_id = sfile.get("file_id")
             db_id = sfile.get("db_id")
@@ -890,8 +998,27 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
                 logger.info(
                     f"[RAG] Adaptive extraction added {len(new_chunks)} chunks for {name}."
                 )
+                adaptive_chunks.extend(
+                    {
+                        "chunk_text": chunk_value,
+                        "file_name": name,
+                        "file_id": file_id,
+                        "source_modified_time": sfile.get("source_modified_time"),
+                        "extraction_version": sfile.get("extraction_version"),
+                        "similarity": 1.0,
+                    }
+                    for chunk_value in new_chunks
+                )
             except Exception as exc:
                 logger.warning(f"[RAG] Adaptive extraction failed for {name}: {exc}")
+
+        if selected_pdf_list_query and adaptive_chunks:
+            return {
+                "retrieved_chunks": chunk_relevance_filter(
+                    adaptive_chunks,
+                    retrieval_query,
+                )
+            }
 
         # Re-run search + filter with fresh embeddings
         retrieved = await _run_vector_search(

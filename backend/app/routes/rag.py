@@ -16,6 +16,7 @@ from app.services.gemini_service import (
     synthesize_answer,
 )
 from app.services.rag_workflow import (
+    _get_full_document_texts,
     create_rag_graph,
     search_cached_user_documents,
 )
@@ -137,7 +138,7 @@ async def _resolve_query_route(
             available_files = get_cached_file_catalog(
                 google_account,
                 page_size=100,
-                expand_folders=False,
+                expand_folders=True,
             )
             if not available_files:
                 try:
@@ -145,11 +146,14 @@ async def _resolve_query_route(
                         list_files_cached,
                         google_account,
                         page_size=100,
-                        expand_folders=False,
+                        expand_folders=True,
                     )
                 except Exception as exc:
-                    logger.warning("[RAG] Drive file catalog load warning: %s", exc)
-                    available_files = []
+                    logger.exception("[RAG] Failed to load the expanded Drive catalog.")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Could not search all Google Drive folders. Please retry.",
+                    ) from exc
 
             if available_files:
                 strong_title_matches = match_files_by_title(
@@ -435,6 +439,7 @@ def _cache_document_evidence(
         file_info.get("name"): (
             str(file_info.get("file_id")),
             file_info.get("source_modified_time"),
+            file_info.get("extraction_version", 0),
         )
         for file_info in safe_files
         if file_info.get("file_id")
@@ -449,7 +454,9 @@ def _cache_document_evidence(
         if file_id and version:
             file_id = str(file_id)
             source_ids.append(file_id)
-            document_versions[file_id] = str(version)
+            document_versions[file_id] = (
+                f"{version}|extract:{file_info.get('extraction_version', 0)}"
+            )
             if file_info.get("name"):
                 source_names.append(file_info["name"])
 
@@ -462,14 +469,22 @@ def _cache_document_evidence(
         if file_id and source_version:
             file_id = str(file_id)
             source_ids.append(file_id)
-            document_versions[file_id] = str(source_version)
+            document_versions[file_id] = (
+                f"{source_version}|extract:{chunk.get('extraction_version', 0)}"
+            )
             if file_name:
                 source_names.append(file_name)
         elif file_name in versions_by_name:
-            matched_id, matched_version = versions_by_name[file_name]
+            (
+                matched_id,
+                matched_version,
+                matched_extraction_version,
+            ) = versions_by_name[file_name]
             if matched_version:
                 source_ids.append(matched_id)
-                document_versions[matched_id] = str(matched_version)
+                document_versions[matched_id] = (
+                    f"{matched_version}|extract:{matched_extraction_version}"
+                )
                 source_names.append(file_name)
 
         sim_val = round(float(chunk.get("similarity", 0)), 3)
@@ -813,15 +828,18 @@ async def _ask_question_uncached(
             await _save_answer(db, user_id, query, answer, intent, "assistant", selected_file_ids=selected_file_ids)
             return _answer_response(query, intent, answer, analysis_required=False, answer_source="assistant")
 
-        available_files = get_cached_file_catalog(google_acc, page_size=100, expand_folders=False)
+        available_files = get_cached_file_catalog(google_acc, page_size=100, expand_folders=True)
         if not available_files:
             try:
                 available_files = await asyncio.to_thread(
-                    list_files_cached, google_acc, page_size=100, expand_folders=False
+                    list_files_cached, google_acc, page_size=100, expand_folders=True
                 )
             except Exception as exc:
-                logger.warning("[RAG] Drive file catalog load warning: %s", exc)
-                available_files = []
+                logger.exception("[RAG] Failed to load the Drive inventory catalog.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not load Google Drive files. Please retry.",
+                ) from exc
 
         answer, candidate_names = _handle_drive_inventory_query(query, available_files or [])
         await _save_answer(
@@ -858,21 +876,25 @@ async def _ask_question_uncached(
         )
 
     query_embedding_cache: Dict[str, List[float]] = {}
-    try:
-        cached_chunks = await search_cached_user_documents(
-            db,
-            user_id,
-            query,
-            retrieval_file_ids,
-            query_embedding_cache=query_embedding_cache,
-        )
-    except Exception as exc:
-        logger.exception("Failed to search the indexed document cache.")
-        raise HTTPException(
-            status_code=500, detail="Failed to search the document cache."
-        ) from exc
+    cached_chunks = []
+    if not retrieval_file_ids:
+        try:
+            cached_chunks = await search_cached_user_documents(
+                db,
+                user_id,
+                query,
+                retrieval_file_ids,
+                query_embedding_cache=query_embedding_cache,
+            )
+        except Exception as exc:
+            logger.exception("Failed to search the indexed document cache.")
+            raise HTTPException(
+                status_code=500, detail="Failed to search the document cache."
+            ) from exc
 
-    if cached_chunks:
+    # Explicit file scopes must pass through the live workflow so stale or
+    # incomplete indexed text cannot prevent query-adaptive extraction.
+    if cached_chunks and not retrieval_file_ids:
         cached_file_names: List[str] = []
         for chunk in cached_chunks:
             file_name = chunk.get("file_name")
@@ -1038,7 +1060,7 @@ async def _ask_question_uncached(
             list_files_cached,
             google_acc,
             page_size=100,
-            expand_folders=False,
+            expand_folders=True,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to access Google Drive: {str(e)}")
@@ -1073,41 +1095,93 @@ async def _ask_question_uncached(
         "_live_tracker": live_tracker,
     }
 
-    # Execute LangGraph RAG Workflow (guaranteed <= 28s execution ceiling)
+    # Leave time for route setup and response persistence inside the 30s request budget.
     workflow_started_at = time.perf_counter()
     try:
         final_state = await asyncio.wait_for(
             rag_graph.ainvoke(initial_state),
-            timeout=28.0,
+            timeout=24.0,
         )
     except asyncio.TimeoutError:
-        logger.warning("[RAG] Workflow reached 28s limit; producing grounded answer from available progress")
+        logger.warning("[RAG] Workflow reached 24s budget; using available document evidence only")
         curr_chunks = live_tracker.get("retrieved_chunks", [])
         safe_files = live_tracker.get("safe_files", [])
         cands = live_tracker.get("candidate_files", [])
         cand_names = [f.get("name") for f in safe_files if f.get("name")] or [f.get("name") for f in cands if f.get("name")]
 
+        if not curr_chunks and safe_files:
+            curr_chunks = [
+                {
+                    "chunk_text": file_info["extracted_text"],
+                    "file_name": file_info.get("name", "Document"),
+                    "file_id": file_info.get("file_id"),
+                    "source_modified_time": file_info.get("source_modified_time"),
+                    "extraction_version": file_info.get("extraction_version"),
+                    "similarity": 1.0,
+                }
+                for file_info in safe_files
+                if file_info.get("extracted_text")
+            ]
+            if not curr_chunks:
+                try:
+                    full_texts = await _get_full_document_texts(
+                        db,
+                        [file_info["db_id"] for file_info in safe_files if file_info.get("db_id")],
+                    )
+                    curr_chunks = [
+                        {
+                            "chunk_text": text,
+                            "file_name": file_name,
+                            "similarity": 1.0,
+                        }
+                        for file_name, text in full_texts.items()
+                    ]
+                except Exception:
+                    logger.exception(
+                        "[RAG] Could not load indexed text after workflow timeout."
+                    )
+
+        timeout_grounded = False
         if curr_chunks:
             try:
                 timeout_ans = await synthesize_answer(
-                    query, curr_chunks, [], selected_file_names=cand_names, auto_discovered=len(retrieval_file_ids) == 0
+                    query,
+                    curr_chunks,
+                    [],
+                    selected_file_names=cand_names,
+                    auto_discovered=len(retrieval_file_ids) == 0,
+                    intent=intent,
                 )
-            except Exception:
-                timeout_ans = f"Based on your document ({', '.join(cand_names) if cand_names else 'Drive file'}), here is what was found regarding '{query}'."
-        elif safe_files and safe_files[0].get("extracted_text"):
-            first_text = safe_files[0].get("extracted_text")[:6000]
-            quick_chunk = [{"chunk_text": first_text, "file_name": cand_names[0] if cand_names else "Document", "similarity": 1.0}]
-            try:
-                timeout_ans = await synthesize_answer(
-                    query, quick_chunk, [], selected_file_names=cand_names, auto_discovered=len(retrieval_file_ids) == 0
+                timeout_grounded = bool(timeout_ans)
+            except Exception as exc:
+                logger.warning(
+                    "[RAG] Evidence-only timeout synthesis failed: %s",
+                    exc,
                 )
-            except Exception:
-                timeout_ans = f"Searched {cand_names[0] if cand_names else 'your document'} for '{query}'."
+                timeout_ans = ""
         else:
-            try:
-                timeout_ans = await answer_general_query(query)
-            except Exception:
-                timeout_ans = f"I searched your connected Google Drive files for '{query}'. Please see the matched file(s) for details."
+            timeout_ans = ""
+
+        if not timeout_ans:
+            target = ", ".join(cand_names) if cand_names else "the selected document"
+            timeout_ans = (
+                f"I couldn't finish extracting searchable text from {target} within the time limit. "
+                "I haven't substituted general knowledge or guessed the candidate list. Please retry; "
+                "if this continues, check the backend logs for PDF OCR errors."
+            )
+
+        if not timeout_grounded:
+            return _answer_response(
+                query,
+                intent,
+                timeout_ans,
+                analysis_required=False,
+                candidate_files=cand_names,
+                safe_embedded_files=cand_names,
+                answer_source="insufficient_drive_evidence",
+                matched_file_ids=matched_file_ids,
+                auto_discovered=not retrieval_file_ids,
+            )
 
         final_state = {
             "answer": timeout_ans,

@@ -36,6 +36,10 @@ async def lifespan(app: FastAPI):
         logger.info("[Startup] Ensuring database tables exist...")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(text("""
+                ALTER TABLE drive_files
+                ADD COLUMN IF NOT EXISTS extraction_version INTEGER NOT NULL DEFAULT 0;
+            """))
             # Ensure PostgreSQL Trigger permanently protects Lead Admin from DELETE:
             await conn.execute(text("""
                 CREATE OR REPLACE FUNCTION protect_lead_admin_from_delete()

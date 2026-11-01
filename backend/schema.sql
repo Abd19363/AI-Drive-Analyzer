@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS drive_files (
     guardrail_status VARCHAR(50) DEFAULT 'UNCHECKED', -- 'UNCHECKED', 'PASSED', 'FLAGGED_CONFIDENTIAL'
     confidentiality_reason TEXT,
     is_embedded BOOLEAN DEFAULT FALSE,
+    extraction_version INTEGER NOT NULL DEFAULT 0,
     last_scanned_at TIMESTAMP WITH TIME ZONE,
     source_modified_time VARCHAR(64),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS drive_files (
 );
 
 ALTER TABLE drive_files
-    ADD COLUMN IF NOT EXISTS source_modified_time VARCHAR(64);
+    ADD COLUMN IF NOT EXISTS source_modified_time VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS extraction_version INTEGER NOT NULL DEFAULT 0;
 
 -- Guardrail Audit Logs (records reasons for blocking confidential files)
 CREATE TABLE IF NOT EXISTS guardrail_logs (
