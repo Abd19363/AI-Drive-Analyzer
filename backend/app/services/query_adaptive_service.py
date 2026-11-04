@@ -108,6 +108,19 @@ def score_chunk_relevance(chunk_text_str: str, query: str) -> int:
     text_lower = chunk_text_str.lower()
     score = 0
 
+    # Constituency code matching boost
+    try:
+        from app.services.query_intent_service import _extract_constituency_codes
+        q_codes = _extract_constituency_codes(query)
+        if q_codes:
+            chunk_codes = _extract_constituency_codes(chunk_text_str)
+            if chunk_codes & q_codes:
+                score += 30
+            elif chunk_codes and not (chunk_codes & q_codes):
+                score -= 25
+    except Exception:
+        pass
+
     # Exact full query match bonus
     q_clean = query.strip().lower()
     if len(q_clean) > 4 and q_clean in text_lower:
@@ -165,19 +178,19 @@ def needs_adaptive_embedding(
     if not retrieved_chunks:
         return True
 
-    # If filename or keyword match is strong, adaptive extraction is not needed
-    if any(c.get("filename_matched") or c.get("keyword_score", 0) >= 2 for c in retrieved_chunks):
+    # Only content relevance can suppress a targeted extraction pass.
+    if any(c.get("keyword_score", 0) >= 2 for c in retrieved_chunks):
         return False
 
     top_similarity = max((c.get("similarity", 0.0) for c in retrieved_chunks), default=0.0)
-    if top_similarity < 0.25:
-        logger.info(f"[AdaptiveGate] Top similarity {top_similarity:.3f} < 0.25 — triggering adaptive extraction.")
+    if top_similarity < 0.40:
+        logger.info(f"[AdaptiveGate] Top similarity {top_similarity:.3f} < 0.40 — triggering adaptive extraction.")
         return True
 
-    # Also trigger if top chunks have zero keyword overlap and low similarity
+    # Also trigger if top chunks have zero keyword overlap and moderate similarity
     top_kw = max((c.get("keyword_score", 0) for c in retrieved_chunks[:5]), default=0)
-    if top_kw == 0 and top_similarity < 0.30:
-        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.30 — triggering adaptive.")
+    if top_kw == 0 and top_similarity < 0.60:
+        logger.info(f"[AdaptiveGate] No keyword hits and sim={top_similarity:.3f} < 0.60 — triggering adaptive.")
         return True
 
     return False
@@ -217,6 +230,18 @@ def _adaptive_sections_txt(raw_text: str, keywords: List[str]) -> List[str]:
         prev = idx
     blocks.append("\n".join(lines[block_start: prev + 1]))
     return blocks
+
+
+def adaptive_sections_from_text(raw_text: str, query: str) -> List[str]:
+    """Find relevant sections in already-extracted text without rereading the source file."""
+    keywords = _extract_query_tokens(query)
+    if not raw_text or not keywords:
+        return []
+    text_lower = raw_text.lower()
+    if not any(keyword in text_lower for keyword in keywords):
+        return []
+    return _adaptive_sections_txt(raw_text, keywords)
+
 
 def _adaptive_sections_docx(docx_bytes: bytes, keywords: List[str]) -> List[str]:
     try:
@@ -290,12 +315,13 @@ def _adaptive_sections_excel(excel_bytes: bytes, keywords: List[str]) -> List[st
             if not rows:
                 continue
             header = [str(c) if c is not None else "" for c in rows[0]]
-            header_str = f"[Sheet: {sheet_name}] " + " | ".join(header)
+            header_str = f"[Sub-Sheet: {sheet_name}] " + " | ".join(header)
             matched_rows = [header_str]
+            sheet_matches_query = any(kw in sheet_name.lower() for kw in keywords)
             for row in rows[1:]:
                 row_str = " | ".join(str(c) if c is not None else "" for c in row)
                 row_lower = row_str.lower()
-                if not keywords or any(kw in row_lower for kw in keywords):
+                if not keywords or sheet_matches_query or any(kw in row_lower for kw in keywords):
                     matched_rows.append(row_str)
             if len(matched_rows) > 1:
                 blocks.append("\n".join(matched_rows[:60]))
@@ -312,9 +338,12 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
     candidate_sections = []
     ocr_pages_done = 0
     candidate_vision_pages_done = 0
-    candidate_party_query = (
-        any(term in keywords for term in ("candidate", "candidates", "contesting"))
-        and any(term in keywords for term in ("party", "parties", "affiliation"))
+    candidate_list_query = (
+        any(term in keywords for term in ("candidate", "candidates", "contesting", "contestants", "nominee", "nominees"))
+        or any(
+            term in keywords
+            for term in ("party", "parties", "affiliation", "symbol", "symbols", "constituency")
+        )
     )
     try:
         import fitz
@@ -333,9 +362,13 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
                 if ocr_text:
                     pt = "\n".join(part for part in (pt, ocr_text) if part)
                 if (
-                    candidate_party_query
+                    candidate_list_query
                     and candidate_vision_pages_done < 10
-                    and re.search(r"\b(?:candidate|candidates|party|affiliation)\b", pt, re.I)
+                    and re.search(
+                        r"\b(?:candidate|candidates|party|affiliation|symbol)\b",
+                        pt,
+                        re.I,
+                    )
                 ):
                     candidate_vision_pages_done += 1
                     pixmap = page.get_pixmap(dpi=300, alpha=False)
@@ -359,8 +392,11 @@ def _adaptive_sections_pdf(pdf_bytes: bytes, keywords: List[str]) -> List[str]:
             return matched_pages
         if all_pages:
             return all_pages[:8]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "PyMuPDF adaptive PDF extraction failed; falling back to pypdf: %s",
+            exc,
+        )
 
     # Fallback with pypdf
     try:

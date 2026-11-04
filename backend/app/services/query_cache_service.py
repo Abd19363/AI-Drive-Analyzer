@@ -158,22 +158,26 @@ async def lookup_cached_answer(
 ) -> Optional[QueryAnswerCache]:
     """Return a complete, safe exact-normalized-query cache entry, if valid."""
     now = datetime.now(timezone.utc)
+    target_qhash = query_hash(query)
+    target_scope = scope_hash(selected_file_ids)
     try:
+        # Match by (user_id, query_hash, scope_hash) so that repeated identical queries
+        # always return identical cached results regardless of transient initial_intent classification.
         result = await db.execute(
             select(QueryAnswerCache)
             .where(
                 QueryAnswerCache.user_id == user_id,
-                QueryAnswerCache.query_hash == query_hash(query),
-                QueryAnswerCache.intent == intent,
-                QueryAnswerCache.scope_hash == scope_hash(selected_file_ids),
-                QueryAnswerCache.answer_kind.in_(
-                    _cache_kinds(intent, allow_general_answer)
-                ),
+                QueryAnswerCache.query_hash == target_qhash,
+                QueryAnswerCache.scope_hash == target_scope,
                 QueryAnswerCache.is_complete.is_(True),
                 QueryAnswerCache.is_safe.is_(True),
                 QueryAnswerCache.expires_at > now,
             )
-            .order_by(QueryAnswerCache.created_at.desc())
+            .order_by(
+                # Prefer grounded document answers first, then assistant/general
+                (QueryAnswerCache.answer_kind == "document").desc(),
+                QueryAnswerCache.created_at.desc(),
+            )
         )
     except Exception as exc:
         logger.exception("Failed to query persistent answer cache.")
@@ -181,8 +185,16 @@ async def lookup_cached_answer(
             "The answer cache could not be queried."
         ) from exc
 
-    allowed_kinds = _cache_kinds(intent, allow_general_answer)
-    for entry in result.scalars().all():
+    entries = result.scalars().all()
+    allowed_kinds = set(_cache_kinds(intent, allow_general_answer))
+    # If general answers are allowed or intent is direct_answer, add general
+    if allow_general_answer or intent == "direct_answer":
+        allowed_kinds.add("general")
+    # Document and assistant answers are always valid cached results for identical queries
+    allowed_kinds.add("document")
+    allowed_kinds.add("assistant")
+
+    for entry in entries:
         if entry.answer_kind not in allowed_kinds:
             continue
         # A previous "not found" result is not reliable enough to short-circuit
@@ -228,7 +240,7 @@ def cached_answer_response(
     }.get(entry.answer_kind, "unknown")
     return {
         "query": query,
-        "intent": intent,
+        "intent": entry.intent or intent,
         "answer": entry.answer_text,
         "answer_source": answer_source,
         "cached": True,

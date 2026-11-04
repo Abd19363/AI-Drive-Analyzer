@@ -65,11 +65,11 @@ export default function UserPortalAuth({ onAuthenticated }) {
         throw new Error(data.detail || "Authentication failed. Please check your credentials.");
       }
 
-      // Save user session in localStorage
-      localStorage.setItem("ai_drive_user_id", data.user_id);
-      localStorage.setItem("ai_drive_user_email", data.email);
+      // Save user session in sessionStorage
+      sessionStorage.setItem("ai_drive_user_id", data.user_id);
+      sessionStorage.setItem("ai_drive_user_email", data.email);
       if (data.token) {
-        localStorage.setItem("ai_drive_user_token", data.token);
+        sessionStorage.setItem("ai_drive_user_token", data.token);
       }
 
       if (onAuthenticated) {
@@ -112,11 +112,11 @@ export default function UserPortalAuth({ onAuthenticated }) {
         throw new Error(data.detail || "Registration failed.");
       }
 
-      // Save user session in localStorage
-      localStorage.setItem("ai_drive_user_id", data.user_id);
-      localStorage.setItem("ai_drive_user_email", data.email);
+      // Save user session in sessionStorage
+      sessionStorage.setItem("ai_drive_user_id", data.user_id);
+      sessionStorage.setItem("ai_drive_user_email", data.email);
       if (data.token) {
-        localStorage.setItem("ai_drive_user_token", data.token);
+        sessionStorage.setItem("ai_drive_user_token", data.token);
       }
 
       setSuccessMsg("Account successfully created! Signing you in...");

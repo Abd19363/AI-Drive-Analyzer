@@ -27,17 +27,36 @@ def get_gemini_client():
     return genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
-def _is_candidate_party_query(query: str, intent: str) -> bool:
-    return (
-        intent == "list"
-        and bool(re.search(r"\b(?:candidate|candidates|contesting|nominee|nominees)\b", query, re.I))
-        and bool(re.search(r"\b(?:party|parties|affiliation|affiliations)\b", query, re.I))
+def _is_candidate_list_query(query: str, intent: str = "general") -> bool:
+    has_candidate = bool(
+        re.search(r"\b(?:candidate|candidates|contesting|contestants?|nominee|nominees)\b", query, re.I)
     )
+    has_election_context = bool(
+        re.search(
+            r"\b(?:party|parties|affiliation|affiliations|symbol|symbols|constituency|electoral|election|na\s*-\s*\d+|pp\s*-\s*\d+|ps\s*-\s*\d+|pk\s*-\s*\d+|pb\s*-\s*\d+)\b",
+            query,
+            re.I,
+        )
+    )
+    is_list_like = intent == "list" or bool(re.search(r"\b(?:give\s+me|list|show|names?|who\s+are|all|every)\b", query, re.I))
+    return has_candidate and (has_election_context or is_list_like)
 
 
-def _validate_candidate_party_answer(
+def _candidate_list_fields(query: str) -> List[str]:
+    fields = []
+    if re.search(r"\b(?:symbol|symbols)\b", query, re.I):
+        fields.append("Allocated symbol")
+    if re.search(r"\b(?:party|parties|affiliation|affiliations)\b", query, re.I):
+        fields.append("Party affiliation")
+    if not fields:
+        fields = ["Allocated symbol", "Party affiliation"]
+    return fields
+
+
+def _validate_candidate_list_answer(
     answer: str,
     source_texts: List[str],
+    fields: List[str],
 ) -> str:
     source_chunks = [
         re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
@@ -46,30 +65,32 @@ def _validate_candidate_party_answer(
     rows = []
     for line in answer.splitlines():
         cells = [cell.strip().strip("*_` ") for cell in line.strip().strip("|").split("|")]
-        if len(cells) != 2:
+        if len(cells) != len(fields) + 1:
             continue
-        candidate, affiliation = cells
+        candidate, *details = cells
         candidate_normalized = re.sub(r"[^a-z0-9]+", " ", candidate.lower()).strip()
-        affiliation_normalized = re.sub(r"[^a-z0-9]+", " ", affiliation.lower()).strip()
-        if not candidate_normalized or not affiliation_normalized:
+        details_normalized = [
+            re.sub(r"[^a-z0-9]+", " ", detail.lower()).strip()
+            for detail in details
+        ]
+        if not candidate_normalized or not all(details_normalized):
             continue
-        if "candidate" in candidate_normalized and (
-            "party" in affiliation_normalized or "affiliation" in affiliation_normalized
-        ):
+        if candidate_normalized == "candidate":
             continue
-        rows.append((candidate_normalized, affiliation_normalized))
+        rows.append((candidate_normalized, details_normalized))
 
     if rows and all(
         any(
-            candidate in source and affiliation in source
+            candidate in source
+            and all(detail in source for detail in details)
             for source in source_chunks
         )
-        for candidate, affiliation in rows
+        for candidate, details in rows
     ):
         return answer
 
     return (
-        "I couldn't verify an exact candidate-and-party list against the text "
+        "I couldn't verify the requested candidate details against the text "
         "extracted from the selected document, so I won't guess. Please retry "
         "after checking the PDF's OCR; if the scan is readable, the list should "
         "be extracted from the document."
@@ -158,11 +179,6 @@ User question: {query}"""
     if not response.text:
         raise RuntimeError("Gemini returned an empty response for the general question.")
     answer = response.text
-    if is_candidate_party_list:
-        answer = _validate_candidate_party_answer(
-            answer,
-            [chunk.get("chunk_text", "") for chunk in chunks_to_include],
-        )
     return sanitize_confidential_output(answer, query)
 
 
@@ -179,7 +195,7 @@ async def classify_general_vs_drive_query(
     from app.services.query_intent_service import (
         is_fast_general_knowledge_query,
         is_drive_inventory_query,
-        match_files_by_title,
+        is_specific_record_query,
         _DOCUMENT_REQUEST_PATTERN,
         _DOCUMENT_SEARCH_PATTERN,
         _PERSONAL_CONTEXT_PATTERN,
@@ -188,6 +204,9 @@ async def classify_general_vs_drive_query(
 
     if is_fast_general_knowledge_query(query):
         return True
+
+    if is_specific_record_query(query):
+        return False
 
     if is_drive_inventory_query(query):
         return False
@@ -201,32 +220,25 @@ async def classify_general_vs_drive_query(
     ):
         return False
 
-    # Check if query matches any title in Drive
-    if available_files:
-        matches = match_files_by_title(query, available_files)
-        if matches:
-            return False
-
-    # For queries of ANY other context, use fast Gemini classification (~1s)
+    # Classify from the request itself; file names must not decide whether a
+    # question is general knowledge or a Drive query.
     try:
         client = get_gemini_client()
-        file_catalog_sample = []
-        if available_files:
-            file_catalog_sample = [f.get("name") for f in available_files[:15] if f.get("name")]
 
-        prompt = f"""You are a query classifier for an AI Drive Document Assistant.
-Determine whether the user query is:
-- GENERAL: A general knowledge, scientific, educational, factual, conversational, programming, or universal world question that does NOT require searching private personal Google Drive files.
-- DRIVE: A query specifically asking about personal, internal, proprietary files, contracts, reports, spreadsheets, or documents in Google Drive.
+        prompt = f"""You are the intent classifier for an AI Drive Document Assistant.
+Classify the USER'S INTENT, not whether the answer might exist on the public internet.
+
+Return GENERAL only for clearly universal, stable, commonly known information, educational explanations, ordinary coding help, or conversation.
+Return DRIVE when the user asks for information from their own/connected files or organization, or requests exact, complete, official, current, local, allocated, assigned, registered, or paired records that should be verified from a source document.
+When the request could reasonably require a specific record, prefer DRIVE so the assistant can check document content before answering. Do not infer the route from filenames; no filenames are provided.
 
 User Query: "{query}"
-Sample file names in Drive: {json.dumps(file_catalog_sample)}
 
 Reply strictly with either GENERAL or DRIVE."""
         config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=5)
         response = await asyncio.wait_for(
             asyncio.to_thread(generate_content_with_fallback, client, prompt, config),
-            timeout=2.0,
+            timeout=5.0,
         )
         res_text = (response.text or "").strip().upper()
         logger.info(f"[ROUTER] Fast LLM query classification for '{query}': {res_text}")
@@ -356,8 +368,8 @@ async def synthesize_answer(
     # Keep model input bounded to reduce latency and prevent oversized prompts.
     context_blocks = []
     is_structure_query = is_document_structure_query(query)
-    is_candidate_party_list = _is_candidate_party_query(query, intent)
-    exhaustive_list_query = is_structure_query or is_candidate_party_list
+    is_candidate_list = _is_candidate_list_query(query, intent)
+    exhaustive_list_query = is_structure_query or is_candidate_list
     remaining_chars = 24000 if exhaustive_list_query else 10000
     chunks_to_include = retrieved_chunks if exhaustive_list_query else retrieved_chunks[:8]
     for idx, chunk in enumerate(chunks_to_include):
@@ -379,6 +391,7 @@ async def synthesize_answer(
         if remaining_chars <= 0:
             break
     context_str = "\n\n".join(context_blocks)
+    candidate_list_fields = _candidate_list_fields(query)
 
     intent_instructions = {
         "direct_answer": "Answer using only the supplied document evidence. If it does not contain the answer, say that the information was not found rather than using general knowledge.",
@@ -391,13 +404,15 @@ async def synthesize_answer(
         "general": "Respond in the format that best fits the user's request.",
     }
     answer_style = intent_instructions.get(intent, intent_instructions["general"])
-    if is_candidate_party_list:
+    if is_candidate_list:
+        requested_details = " and ".join(field.lower() for field in candidate_list_fields)
+        column_headers = " | ".join(["Candidate", *candidate_list_fields])
         answer_style = (
-            "Extract every contesting candidate and the party affiliation explicitly associated with that candidate "
-            "in the supplied document. Return only a table with Candidate and Party affiliation columns, followed "
-            "by the source filename. Do not add a constituency overview, election history, likely parties, or "
-            "outside knowledge. Do not infer a party from a candidate's name or from a party mentioned elsewhere. "
-            "If the supplied text does not show the candidate list or affiliations clearly, say that the list could "
+            f"Extract every contesting candidate and the {requested_details} explicitly associated with that candidate "
+            f"in the supplied document. Return only a table with these columns: {column_headers}. "
+            "Add the source filename after the table. Do not add a constituency overview, election history, likely parties, or "
+            "outside knowledge. Do not infer a detail from a candidate's name or from unrelated text. "
+            "If the supplied text does not show the candidate list or requested details clearly, say that the list could "
             "not be read from the selected document instead of guessing."
         )
 
@@ -429,6 +444,7 @@ async def synthesize_answer(
     )
 
     prompt = f"""You are a secure, privacy-first AI Assistant. You MUST answer the user's query using ONLY the document content provided below.
+    File names are labels for identifying and citing sources; they are not evidence. Never infer facts from a file name.
 
 === USER QUERY ===
 "{query}"
@@ -480,7 +496,7 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
   "Please ask query about textual files(other than images or video files)"
 - If the document contains code, schemas, or commands, format them in markdown code blocks.
 - If files were withheld for privacy, mention why briefly without using internal technical jargon.
-{"For this candidate-and-party list, include only explicitly paired names and affiliations present in the supplied document. Never substitute general political background or historically active parties for the requested list." if is_candidate_party_list else ""}
+{"For this candidate list, include only explicitly paired names and requested details present in the supplied document. Never substitute general political background or infer missing details." if is_candidate_list else ""}
 """
 
     config = types.GenerateContentConfig(
@@ -499,17 +515,25 @@ ONLY if after reading ALL chunks you genuinely find ZERO relevant information, r
         fast_config = types.GenerateContentConfig(temperature=0.2, max_output_tokens=512)
         fast_prompt = (
             "Answer using ONLY the document evidence below. Do not use outside knowledge, "
-            "add background, or infer missing facts. If evidence does not state the answer, "
+            "treat filenames as evidence, add background, or infer missing facts. "
+            "If evidence does not state the answer, "
             "say that it is not shown in the supplied text.\n"
             f"Question: {query}\n"
-            f"{'For this request, list every explicitly named contesting candidate and the party affiliation paired with that candidate. Return only a table; do not list historically active parties.' if is_candidate_party_list else ''}\n"
+            f"{'For this request, list every explicitly named contesting candidate and the requested party affiliation or election symbol paired with that candidate. Return only a table.' if is_candidate_list else ''}\n"
             f"Document evidence:\n{context_str[:12000]}"
         )
         response = await asyncio.to_thread(
             generate_content_with_fallback, client, fast_prompt, fast_config
         )
 
-    return sanitize_confidential_output(response.text, query)
+    answer = response.text or ""
+    if is_candidate_list:
+        answer = _validate_candidate_list_answer(
+            answer,
+            [chunk.get("chunk_text", "") for chunk in chunks_to_include],
+            candidate_list_fields,
+        )
+    return sanitize_confidential_output(answer, query)
 
 def sanitize_confidential_output(text: str, query: str = "") -> str:
     """

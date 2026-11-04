@@ -2,7 +2,7 @@ import re
 from typing import Dict, Any, Tuple
 from app.services.extractor_service import (
     extract_content,
-    refine_candidate_party_pdf_ocr,
+    refine_candidate_list_pdf_ocr,
 )
 
 # 1. Metadata Suspicious Patterns
@@ -120,7 +120,7 @@ def run_guardrails(
     file_bytes: bytes,
     *,
     allow_vision_fallback: bool = True,
-    candidate_party_query: bool = False,
+    candidate_list_query: bool = False,
 ) -> Dict[str, Any]:
     """
     Full 4-Layer Guardrail Pipeline:
@@ -150,12 +150,12 @@ def run_guardrails(
         run_ocr_if_sparse=True,
         allow_vision_fallback=allow_vision_fallback,
     )
-    if candidate_party_query and (
+    if candidate_list_query and (
         file_bytes.startswith(b"%PDF")
         or "pdf" in mime_type.lower()
         or file_name.lower().endswith(".pdf")
     ):
-        extracted_text = refine_candidate_party_pdf_ocr(
+        extracted_text = refine_candidate_list_pdf_ocr(
             file_bytes,
             extracted_text,
         )

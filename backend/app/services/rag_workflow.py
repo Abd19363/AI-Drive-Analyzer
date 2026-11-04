@@ -23,11 +23,12 @@ from app.services.extractor_service import (
 )
 from app.services.embedding_service import get_or_create_embeddings, embed_single_query
 from app.services.gemini_service import (
-    _is_candidate_party_query,
+    _is_candidate_list_query,
     analyze_query_for_drive_files,
     synthesize_answer,
 )
 from app.services.query_adaptive_service import (
+    adaptive_sections_from_text,
     adaptive_embed_for_query,
     adaptive_embed_pdf_for_query,  # kept for backward compat
     chunk_relevance_filter,
@@ -38,6 +39,7 @@ from app.services.query_intent_service import (
     QueryIntent,
     implicit_sheet_name_candidate,
     is_document_structure_query,
+    filter_files_by_query_scope,
     match_files_by_title,
     requested_sheet_name,
 )
@@ -97,6 +99,7 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
 
         # User selected mixed files; filter out media so only textual files are processed
         candidate_files = [f for f in candidate_files if not is_media_file(f)]
+        candidate_files = filter_files_by_query_scope(query, candidate_files)
     else:
         # Auto-discovery: identify ONLY the relevant candidate file(s) for the query
         auto_discovered = True
@@ -116,6 +119,8 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
             candidate_files = await analyze_query_for_drive_files(query, available_files)
             candidate_files = [f for f in candidate_files if not is_media_file(f)]
             logger.info(f"[RAG] Auto-discovery identified {len(candidate_files)} candidate file(s): {[f.get('name') for f in candidate_files]}")
+
+        candidate_files = filter_files_by_query_scope(query, candidate_files)
 
     # Expand candidate folders into all descendant documents from the catalog.
     expanded = []
@@ -162,7 +167,11 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
     seen = set()
     unique_candidates = [f for f in expanded if f.get("id") not in seen and not seen.add(f.get("id"))]
     # A matched folder represents the search scope, so retain every descendant file.
-    max_cands = len(unique_candidates) if expanded_folder else (3 if selected_file_ids else 1)
+    max_cands = (
+        len(unique_candidates)
+        if expanded_folder or selected_file_ids
+        else 3
+    )
     return {"candidate_files": unique_candidates[:max_cands], "auto_discovered": auto_discovered, "is_media_query": False}
 
 async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
@@ -179,9 +188,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
     candidate_files = state["candidate_files"]
     query = state["query"]
     intent = state.get("intent", "general")
-    selected_candidate_party_list = (
-        bool(state.get("selected_file_ids"))
-        and _is_candidate_party_query(query, intent)
+    selected_candidate_list_query = (
+        _is_candidate_list_query(query, intent)
     )
 
     safe_files = []
@@ -332,8 +340,8 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
                 file_info["file_name"],
                 file_info["mime_type"],
                 file_bytes,
-                allow_vision_fallback=not selected_candidate_party_list,
-                candidate_party_query=selected_candidate_party_list,
+                allow_vision_fallback=not selected_candidate_list_query,
+                candidate_list_query=selected_candidate_list_query,
             )
             return file_info, guard_result, None, file_bytes
 
@@ -410,9 +418,8 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
     safe_files = state["safe_files"]
     chunks_to_store = []
     indexed_file_ids = set()
-    selected_candidate_party_list = (
-        bool(state.get("selected_file_ids"))
-        and _is_candidate_party_query(
+    selected_candidate_list_query = (
+        _is_candidate_list_query(
             state.get("query", ""),
             state.get("intent", "general"),
         )
@@ -456,32 +463,8 @@ async def node_index_safe_files(state: RAGState) -> Dict[str, Any]:
         if not chunks:
             continue
 
-        if (
-            selected_candidate_party_list
-            and (
-                "pdf" in (sfile.get("mime_type") or "").lower()
-                or (sfile.get("name") or "").lower().endswith(".pdf")
-            )
-        ):
-            indexed_file_ids.add(sfile["db_id"])
-            for idx, chunk_value in enumerate(chunks):
-                db.add(DocumentChunk(
-                    file_id=sfile["db_id"],
-                    user_id=user_id,
-                    chunk_index=idx,
-                    chunk_text=chunk_value.replace("\x00", ""),
-                    embedding=None,
-                    token_count=len(chunk_value.split()),
-                    metadata_={
-                        "file_name": sfile["name"],
-                        "file_id": sfile["file_id"],
-                        "text_only": True,
-                    },
-                ))
-            continue
-
-        # Cap on-demand chunk indexing to at most 35 chunks per file to guarantee <= 1s embedding time
-        capped_chunks = chunks[:35]
+        # Cap on-demand chunk indexing to at most 150 chunks per file
+        capped_chunks = chunks[:150]
         indexed_file_ids.add(sfile["db_id"])
         chunks_to_store.extend(
             (sfile, idx, chunk_str)
@@ -590,7 +573,7 @@ async def _run_filename_and_title_search(
 
     sql = text("""
         SELECT dc.chunk_text, df.name as file_name,
-               0.90 as similarity,
+               0.0 as similarity,
                df.file_id, df.source_modified_time, df.extraction_version
         FROM document_chunks dc
         JOIN drive_files df ON dc.file_id = df.id
@@ -599,7 +582,7 @@ async def _run_filename_and_title_search(
         LIMIT :lim;
     """)
     chunk_res = await db.execute(sql, {"matched_ids": matching_file_ids, "lim": limit})
-    return [
+    matching_chunks = [
         {
             "chunk_text": row[0],
             "file_name": row[1],
@@ -607,9 +590,13 @@ async def _run_filename_and_title_search(
             "file_id": row[3],
             "source_modified_time": row[4],
             "extraction_version": row[5],
-            "filename_matched": True,
         }
         for row in chunk_res
+    ]
+    return [
+        chunk
+        for chunk in chunk_relevance_filter(matching_chunks, query)
+        if chunk.get("keyword_score", 0) > 0
     ]
 
 
@@ -621,7 +608,7 @@ async def search_cached_user_documents(
     query_embedding_cache: Optional[Dict[str, List[float]]] = None,
 ) -> List[Dict[str, Any]]:
     """Search previously indexed, guardrail-approved chunks before accessing Drive."""
-    statement = select(DriveFile.id).where(
+    statement = select(DriveFile.id, DriveFile.name).where(
         DriveFile.user_id == user_id,
         DriveFile.guardrail_status == "PASSED",
         DriveFile.is_embedded.is_(True),
@@ -630,8 +617,20 @@ async def search_cached_user_documents(
     if selected_file_ids:
         statement = statement.where(DriveFile.file_id.in_(selected_file_ids))
 
-    result = await db.execute(statement)
-    safe_db_ids = list(result.scalars().all())
+    file_rows = (await db.execute(statement)).all()
+    if not file_rows:
+        return []
+
+    from app.services.query_intent_service import _extract_constituency_codes
+    q_codes = _extract_constituency_codes(query)
+    if q_codes and not selected_file_ids:
+        coded_ids = [fid for fid, fname in file_rows if _extract_constituency_codes(fname or "") & q_codes]
+        if coded_ids:
+            safe_db_ids = coded_ids
+        else:
+            safe_db_ids = [fid for fid, fname in file_rows if not _extract_constituency_codes(fname or "")]
+    else:
+        safe_db_ids = [fid for fid, _ in file_rows]
     if not safe_db_ids:
         return []
 
@@ -692,7 +691,7 @@ async def search_cached_user_documents(
         c for c in retrieved
         if c.get("similarity", 0) >= 0.22
         or (c.get("similarity", 0) >= 0.15 and c.get("keyword_score", 0) >= 2)
-        or c.get("filename_matched")
+        or c.get("keyword_score", 0) >= 1
     ]
     if meaningful:
         return meaningful[:12]
@@ -867,9 +866,10 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
 
     safe_db_ids = [s["db_id"] for s in safe_files]
     retrieval_query = expand_query_for_retrieval(query)
+    from app.services.query_intent_service import _extract_constituency_codes
+    has_constituency_code = bool(_extract_constituency_codes(query))
     selected_pdf_list_query = (
-        not state.get("auto_discovered")
-        and _is_candidate_party_query(query, state.get("intent", "general"))
+        (_is_candidate_list_query(query, state.get("intent", "general")) or has_constituency_code)
         and any(
             "pdf" in (sfile.get("mime_type") or "").lower()
             or (sfile.get("name") or "").lower().endswith(".pdf")
@@ -952,7 +952,7 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
     # text or a high semantic score makes the initial index look relevant.
     top_sim = max((c.get("similarity", 0) for c in retrieved), default=0)
     top_kw = max((c.get("keyword_score", 0) for c in retrieved), default=0)
-    has_strong_evidence = top_sim >= 0.28 or top_kw >= 2 or any(c.get("filename_matched") for c in retrieved)
+    has_strong_evidence = (top_kw >= 2 and top_sim >= 0.40) or top_sim >= 0.60
 
     if (
         not state.get("auto_discovered")
@@ -974,6 +974,30 @@ async def node_vector_search(state: RAGState) -> Dict[str, Any]:
             name = sfile.get("name", "")
 
             try:
+                cached_text = sfile.get("extracted_text") or full_doc_texts.get(name, "")
+                cached_sections = await asyncio.to_thread(
+                    adaptive_sections_from_text,
+                    cached_text,
+                    retrieval_query,
+                )
+                if cached_sections:
+                    logger.info(
+                        "[RAG] Reused extracted text for adaptive retrieval from %s.",
+                        name,
+                    )
+                    adaptive_chunks.extend(
+                        {
+                            "chunk_text": section,
+                            "file_name": name,
+                            "file_id": file_id,
+                            "source_modified_time": sfile.get("source_modified_time"),
+                            "extraction_version": sfile.get("extraction_version"),
+                            "similarity": 1.0,
+                        }
+                        for section in cached_sections
+                    )
+                    continue
+
                 res = await db.execute(select(DriveFile).where(DriveFile.id == db_id))
                 db_file = res.scalars().first()
                 mime = db_file.mime_type if db_file else "application/octet-stream"

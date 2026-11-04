@@ -240,21 +240,6 @@ _GENERAL_KNOWLEDGE_PATTERNS = (
         r"computer|penicillin|gravity|telescope|electricity|mona\s+lisa|hamlet|radio|world\s+wide\s+web)\b",
         re.I,
     ),
-    # General Definitions & Tech Concepts
-    re.compile(
-        r"^\s*(?:what\s+is|what\s+are|define|definition\s+of|explain|tell\s+me\s+about)\s+(?:a\s+|an\s+|the\s+)?(?:algorithm|artificial\s+intelligence|"
-        r"machine\s+learning|deep\s+learning|blockchain|cryptocurrency|http|https|tcp|udp|api|dns|cloud\s+computing|"
-        r"operating\s+system|photosynthesis|gravity|entropy|inflation|recession|gross\s+domestic\s+product|gdp|democracy|"
-        r"republic|ecosystem|biodiversity|ozone\s+layer|greenhouse\s+effect|black\s+hole|"
-        r"python|javascript|typescript|java|c\+\+|golang|rust|ruby|php|swift|react|vue|angular|docker|kubernetes|git|linux|sql)"
-        r"(?:\s+(?:programming\s+)?language|\s+framework|\s+library|\s+protocol)?\b[?.!]*\s*$",
-        re.I,
-    ),
-    # General Coding & Programming Tasks
-    re.compile(
-        r"\b(?:write|create|give\s+me|generate)\s+(?:a\s+)?(?:python|javascript|typescript|java|c\+\+|c\#|sql|html|css|bash|ruby|go|rust)\s+(?:code|script|function|program|query|snippet|algorithm)\b",
-        re.I,
-    ),
     # Common Trivia & Measurements
     re.compile(
         r"\b(?:tallest\s+animal|largest\s+mammal|fastest\s+animal|how\s+many\s+(?:continents|planets|countries|states|bones\s+in\s+the\s+human\s+body|hours\s+in\s+a\s+day|days\s+in\s+a\s+year|seconds\s+in\s+an?\s+hour))\b",
@@ -295,42 +280,38 @@ _INTENT_PATTERNS: tuple[tuple[QueryIntent, re.Pattern[str]], ...] = (
     ),
     (
         "list",
-        re.compile(r"\b(list|enumerate|all|every|names of|items)\b", re.I),
+        re.compile(r"\b(list|enumerate|all|every|names of|names and|names|items|candidates?)\b", re.I),
     ),
 )
 
 _STRUCTURE_INVENTORY_PATTERN = re.compile(
-    r"\b(?:how many|number of|count|list|name|names of)\b.{0,60}\b"
-    r"(?:sections?|tabs?|worksheets?|chapters?|parts?|headings?)\b|"
-    r"\b(?:sections?|tabs?|worksheets?|chapters?|parts?|headings?)\b"
-    r".{0,50}\b(?:count|names?|titles?|list)\b",
+    r"\b(?:what|which|show|display|list|how many|number of|count|name|names of)\b.{0,60}\b"
+    r"(?:sections?|tabs?|worksheets?|sub-?sheets?|sub\s+sheets?|sheets?|chapters?|parts?|headings?)\b|"
+    r"\b(?:sections?|tabs?|worksheets?|sub-?sheets?|sub\s+sheets?|sheets?|chapters?|parts?|headings?)\b"
+    r".{0,50}\b(?:count|names?|titles?|list|available|contain|in\s+(?:the|this))\b",
     re.I,
 )
 
+_SHEET_TERM = r"(?:sub-?sheets?|sub\s+sheets?|worksheets?|sheets?|tabs?)"
+
 _QUOTED_SHEET_PATTERN = re.compile(
-    r"\b(?:in|from|on|within)\s+(?:the\s+)?[\"']([^\"']{1,100})[\"']\s+"
-    r"(?:sheet|tab|worksheet)\b",
+    rf"\b(?:in|from|on|within)\s+(?:the\s+)?[\"']([^\"']{{1,100}})[\"']\s+{_SHEET_TERM}\b",
     re.I,
 )
 _QUOTED_TRAILING_SHEET_PATTERN = re.compile(
-    r"[\"']([^\"']{1,100})[\"']\s+(?:sheet|tab|worksheet)\b",
+    rf"[\"']([^\"']{{1,100}})[\"']\s+{_SHEET_TERM}\b",
     re.I,
 )
 _NAMED_SHEET_PATTERN = re.compile(
-    r"\b(?:sheet|tab|worksheet)\s+(?:named|called|titled)\s+"
-    r"[\"']?(.+?)[\"']?(?=\s+(?:for|about|with|that|to|and)\b|[?.!,;]|$)",
+    rf"\b{_SHEET_TERM}\s+(?:named|called|titled)\s+[\"']?(.+?)[\"']?(?=\s+(?:for|about|with|that|to|and|in)\b|[?.!,;]|$)",
     re.I,
 )
 _PREFIXED_SHEET_PATTERN = re.compile(
-    r"\b(?:in|from|on|within)\s+(?:the\s+)?"
-    r"(?:sheet|tab|worksheet)\s*(?::|=)?\s*[\"']?(.+?)[\"']?"
-    r"(?=\s+(?:for|about|with|that|to|and)\b|[?.!,;]|$)",
+    rf"\b(?:in|from|on|within)\s+(?:the\s+)?{_SHEET_TERM}\s*(?::|=|\s)\s*[\"']?([a-zA-Z0-9_\-\s]+?)[\"']?(?=\s+(?:for|about|with|that|to|and|in)\b|[?.!,;]|$)",
     re.I,
 )
 _TRAILING_SHEET_PATTERN = re.compile(
-    r"\b(?:in|from|on|within)\s+(?:the\s+)?"
-    r"[\"']?([a-z0-9][a-z0-9 _&-]{0,80}?)\s+"
-    r"(?:sheet|tab|worksheet)\b",
+    rf"\b(?:in|from|on|within)\s+(?:the\s+)?[\"']?([a-zA-Z0-9][a-zA-Z0-9 _&-]{{0,80}}?)\s+{_SHEET_TERM}\b",
     re.I,
 )
 _IMPLICIT_SHEET_REQUEST_PATTERNS = (
@@ -340,6 +321,12 @@ _IMPLICIT_SHEET_REQUEST_PATTERNS = (
         re.I,
     ),
 )
+
+_SHEET_GENERIC_WORDS = {
+    "the", "this", "that", "a", "an", "all", "each", "every",
+    "excel", "file", "files", "workbook", "workbooks", "sheet", "sheets",
+    "subsheet", "subsheets", "sub-sheet", "sub-sheets", "tab", "tabs",
+}
 
 
 def requested_sheet_name(query: str) -> str | None:
@@ -354,10 +341,10 @@ def requested_sheet_name(query: str) -> str | None:
         match = pattern.search(query)
         if match:
             name = match.group(1).strip().strip("\"' ")
-            if name:
+            if name and name.lower() not in _SHEET_GENERIC_WORDS:
                 return name
 
-    sheet_marker = re.search(r"\b(?:sheet|tab|worksheet)\b", query, re.I)
+    sheet_marker = re.search(r"\b(?:sub-?sheets?|sub\s+sheets?|worksheets?|sheets?|tabs?)\b", query, re.I)
     if sheet_marker:
         prefix = query[:sheet_marker.start()]
         for marker in reversed(list(re.finditer(
@@ -368,7 +355,7 @@ def requested_sheet_name(query: str) -> str | None:
             name = prefix[marker.end():].strip().strip("\"' ")
             if name.lower().startswith("the "):
                 name = name[4:].strip()
-            if name and len(name) <= 100 and len(name.split()) <= 8:
+            if name and name.lower() not in _SHEET_GENERIC_WORDS and len(name) <= 100 and len(name.split()) <= 8:
                 return name
     return None
 
@@ -390,71 +377,148 @@ def match_files_by_title(
     available_files: List[Dict[str, Any]],
     minimum_score: int = 1,
 ) -> List[Dict[str, Any]]:
-    """Resolve document-title mentions using scored relevance."""
+    """Resolve document-title and folder mentions using scored keyword relevance."""
     ignored = {
         "the", "a", "an", "of", "for", "to", "in", "on", "about", "and",
         "or", "with", "by", "from", "at", "is", "are", "be", "this", "that",
         "these", "those", "my", "our", "your", "give", "me", "show", "tell",
         "what", "who", "when", "where", "how", "can", "you", "please",
-        "questions", "question", "names", "name", "contesting", "candidates", "candidate",
+        "would", "could", "should", "do", "does", "did", "as", "into",
+        "having", "have", "had", "been", "was", "were", "it", "its",
     }
-    q_tokens = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t not in ignored]
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t not in ignored and len(t) >= 2]
     if not q_tokens:
         return []
 
     q_nums = [t for t in q_tokens if t.isdigit()]
     scored = []
+    has_folder_keyword = bool(re.search(r"\b(?:folders?|directories|directory)\b", query, re.I))
 
     for file_info in available_files:
         name = file_info.get("name", "")
-        is_folder = file_info.get("mimeType") == "application/vnd.google-apps.folder"
-        base_name = os.path.splitext(name)[0].lower()
+        if not name:
+            continue
+        is_folder = (
+            file_info.get("mimeType") == "application/vnd.google-apps.folder"
+            or file_info.get("is_folder", False)
+        )
+        base_name = os.path.splitext(name)[0].lower() if not is_folder else name.lower()
         file_tokens = set(re.findall(r"[a-z0-9]+", base_name))
 
         score = 0
         matched_tokens = []
         for qt in q_tokens:
             if qt in file_tokens:
-                weight = 25 if (qt in q_nums or len(qt) >= 5) else 10
+                weight = 40 if qt.isdigit() else (25 if len(qt) >= 4 else 15)
                 score += weight
                 matched_tokens.append(qt)
-            elif any(qt in ft for ft in file_tokens if len(qt) >= 4):
-                score += 5
+            elif any(qt in ft for ft in file_tokens if len(qt) >= 3):
+                score += 12
                 matched_tokens.append(f"~{qt}")
+            elif any(ft in qt for ft in file_tokens if len(ft) >= 4):
+                score += 10
+                matched_tokens.append(f"<{qt}")
 
         # Heavy boost for exact numerical codes like '116' in NA-116
         for num in q_nums:
             if num in file_tokens:
-                score += 50
+                score += 40
             elif any(num in ft for ft in file_tokens):
+                score += 25
+
+        # Consecutive phrase match bonus (e.g. 'full stack roadmap' or 'form 33')
+        clean_f = re.sub(r"[^a-z0-9]+", " ", base_name)
+        for i in range(len(q_tokens) - 1):
+            pair = f"{q_tokens[i]} {q_tokens[i+1]}"
+            if pair in clean_f:
                 score += 30
 
-        # Substring phrase match bonus
-        clean_f = re.sub(r"[^a-z0-9]+", " ", base_name)
+        # Substring word boundary bonus
         for qt in q_tokens:
             if len(qt) >= 3 and re.search(r"\b" + re.escape(qt) + r"\b", clean_f):
-                score += 15
+                score += 10
 
-        # Penalize pure folders when individual documents match
-        if is_folder:
-            score -= 20
+        # Folder relevance boost when user mentions folder
+        if is_folder and has_folder_keyword and score > 0:
+            score += 20
 
-        # Penalize huge textbook-like files (> 15MB) when other documents match
+        # Light penalty for huge files (> 25MB) only when other files match
         size = file_info.get("size")
-        if size and int(size) > 15 * 1024 * 1024:
+        if size and int(size) > 25 * 1024 * 1024:
             score -= 10
 
         if score >= minimum_score:
             scored.append((score, file_info))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    # Return top 2-3 highest-scoring files
-    return [item[1] for item in scored[:3]]
+    # Return top highest-scoring files or folders
+    return [item[1] for item in scored[:5]]
 
 
 def is_document_structure_query(query: str) -> bool:
     """Identify requests that need a whole-document inventory of headings or tabs."""
     return bool(_STRUCTURE_INVENTORY_PATTERN.search(query))
+
+
+_CONSTITUENCY_PATTERN = re.compile(
+    r"\b(?:constituency\s+(?:na|pp|pk|ps)\s*[-–—_]?\s*\d+|(?:na|pp|pk|ps)\s*[-–—_]?\s*\d+)\b",
+    re.I,
+)
+
+
+def _extract_constituency_codes(text: str) -> set:
+    """Extract normalized constituency codes (e.g. {'na-116', 'pp-55'}) from query or file name."""
+    if not text:
+        return set()
+    matches = re.findall(
+        r"(?i)(?:^|[^a-z0-9])(na|pp|pk|ps)\s*[-–—_]?\s*(\d+)(?:$|[^a-z0-9])",
+        text,
+    )
+    return {f"{prefix.lower()}-{num}" for prefix, num in matches}
+
+
+def is_constituency_data_query(query: str) -> bool:
+    """Identify requests asking for election constituency candidates, Form-33, or symbols."""
+    return bool(_CONSTITUENCY_PATTERN.search(query))
+
+
+def is_specific_record_query(query: str) -> bool:
+    """Identify requests asking for specific records, forms, IDs, candidates, or documents."""
+    return is_constituency_data_query(query) or bool(
+        re.search(
+            r"\b(?:form\s*[-–—_]?\s*\d+|invoices?|receipts?|salary\s+slip|cnic|passport|contracts?|nda|specifications?|requirements?|roadmaps?|syllab(?:us|i)|curricul(?:um|a))\b",
+            query,
+            re.I,
+        )
+    )
+
+
+def filter_files_by_query_scope(
+    query: str, files: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    If the query mentions a specific constituency code (e.g. NA-116),
+    filter candidate files so that only files matching that constituency code
+    are kept, preventing pollution from other constituencies.
+    """
+    if not files:
+        return files
+
+    m = re.search(r"\b(na|pp|pk|ps)\s*[-–—]?\s*(\d+)\b", query, re.I)
+    if not m:
+        return files
+
+    prefix = m.group(1).lower()
+    num = m.group(2)
+    target_tokens = [f"{prefix}-{num}", f"{prefix}_{num}", f"{prefix} {num}", num]
+
+    filtered = []
+    for f in files:
+        fname = (f.get("name") or "").lower()
+        if any(tok in fname for tok in target_tokens):
+            filtered.append(f)
+
+    return filtered if filtered else files
 
 
 def classify_query_intent(

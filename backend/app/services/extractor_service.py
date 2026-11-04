@@ -1,7 +1,26 @@
 import io
 import logging
+import time
+from functools import wraps
+
+def _log_time(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        elapsed = time.time() - start
+        logger.debug(f"{func.__name__} took {elapsed:.2f}s")
+        return result
+    return wrapper
 import os
+import shutil
+from functools import lru_cache
+
+# Simple in‑memory cache for PDF extraction (keyed by SHA‑256 of the file bytes)
+_pdf_extraction_cache: dict[str, str] = {}
+
 import re
+import os
 import shutil
 from pathlib import Path
 from PIL import Image
@@ -10,10 +29,17 @@ from docx import Document
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-DOCUMENT_EXTRACTION_VERSION = 4
-PDF_OCR_PAGE_LIMIT = 100
+DOCUMENT_EXTRACTION_VERSION = 7
+# PDF OCR configuration – tuned for speed while keeping accuracy.
+PDF_OCR_PAGE_LIMIT = int(os.getenv("PDF_OCR_PAGE_LIMIT", "20"))   # default 20 pages
+# Fast OCR mode: if FAST_OCR env var true, lower DPI and page limit for speed
+FAST_OCR = os.getenv("FAST_OCR", "false").lower() == "true"
+if FAST_OCR:
+    PDF_OCR_DPI = 90  # faster rendering
+    PDF_OCR_PAGE_LIMIT = 5  # fewer pages OCRed
+    logger.info("Fast OCR mode enabled: DPI=%s, page_limit=%s", PDF_OCR_DPI, PDF_OCR_PAGE_LIMIT)
 PDF_IMAGE_COVERAGE_THRESHOLD = 0.35
-PDF_OCR_DPI = 150
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "120"))               # default 120 DPI
 
 if settings.TESSERACT_CMD:
     configured_tesseract = shutil.which(settings.TESSERACT_CMD)
@@ -132,7 +158,7 @@ def ocr_image_with_gemini_vision(
         return ""
 
 
-def refine_candidate_party_pdf_ocr(
+def refine_candidate_list_pdf_ocr(
     pdf_bytes: bytes,
     extracted_text: str,
     *,
@@ -150,7 +176,7 @@ def refine_candidate_party_pdf_ocr(
     for page_number, page_text in page_blocks:
         if re.search(
             r"\b(?:candidate|candidates|contesting|nominee|nominees|party|"
-            r"affiliation|NA[\s-]*61)\b",
+            r"affiliation|symbol|symbols|NA[\s-]*\d+)\b",
             page_text,
             flags=re.IGNORECASE,
         ):
@@ -206,12 +232,19 @@ def refine_candidate_party_pdf_ocr(
     return extracted_text
 
 
+@_log_time
 def extract_text_from_pdf(
     pdf_bytes: bytes,
     run_ocr_if_sparse: bool = True,
     max_ocr_pages: int = PDF_OCR_PAGE_LIMIT,
     allow_vision_fallback: bool = True,
 ) -> str:
+    """Extract text from a PDF.
+
+    * ``max_ocr_pages`` controls how many pages are sent through OCR.
+      If the value is ``0`` or ``-1`` we treat it as *unlimited* and
+      automatically use the total number of pages in the document.
+    """
     """
     Extracts text from PDF bytes using PyMuPDF (fitz) or pypdf.
     Sparse pages are OCRed locally with Tesseract first, with Gemini Vision as
@@ -227,6 +260,10 @@ def extract_text_from_pdf(
     try:
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        # If caller requests unlimited OCR (0 or -1), treat as all pages
+        if max_ocr_pages in (0, -1):
+            max_ocr_pages = total_pages
         for page_idx, page in enumerate(doc):
             pt = (page.get_text() or "").strip()
             if (
@@ -251,8 +288,11 @@ def extract_text_from_pdf(
         doc.close()
         if extracted_pages:
             return "\n\n".join(extracted_pages)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "PyMuPDF PDF extraction failed; falling back to pypdf: %s",
+            exc,
+        )
 
     # 2. Fallback to pypdf (always available)
     try:
@@ -379,21 +419,22 @@ def extract_content(
         return extract_text_from_docx(file_bytes)
     elif "presentation" in mime_type or name_lower.endswith(".pptx") or name_lower.endswith(".ppt"):
         return extract_text_from_pptx(file_bytes)
-    elif mime_type == "application/vnd.google-apps.spreadsheet" or name_lower.endswith(".csv"):
-        try:
-            return file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            return file_bytes.decode("latin-1", errors="ignore").replace("\x00", "")
-    elif name_lower.endswith(".xlsx") or "spreadsheetml" in mime_type:
+    elif (
+        mime_type == "application/vnd.google-apps.spreadsheet"
+        or name_lower.endswith(".xlsx")
+        or "spreadsheetml" in mime_type
+        or file_bytes.startswith(b"PK\x03\x04")
+    ):
         try:
             import openpyxl
             wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
-            sheet_texts = []
-            for sheet_name in wb.sheetnames:
+            sheet_names = wb.sheetnames
+            sheet_texts = [f"[Workbook Summary: File contains {len(sheet_names)} Sub-Sheets: {', '.join(sheet_names)}]"]
+            for sheet_name in sheet_names:
                 ws = wb[sheet_name]
-                rows = list(ws.iter_rows(max_row=200, values_only=True))
+                rows = list(ws.iter_rows(max_row=500, values_only=True))
                 if rows:
-                    sheet_lines = [f"[Sheet: {sheet_name}]"]
+                    sheet_lines = [f"[Sub-Sheet: {sheet_name}]"]
                     for row in rows:
                         row_vals = [str(c) if c is not None else "" for c in row]
                         if any(v.strip() for v in row_vals):
@@ -403,6 +444,11 @@ def extract_content(
             return "\n\n".join(sheet_texts)
         except Exception:
             return file_bytes.decode("utf-8", errors="ignore")
+    elif name_lower.endswith(".csv") or mime_type == "text/csv":
+        try:
+            return file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return file_bytes.decode("latin-1", errors="ignore").replace("\x00", "")
     else:
         # Fallback to UTF-8 decoding for text, csv, json, md, etc.
         try:
@@ -415,11 +461,15 @@ def extract_content(
 
 
 def extract_excel_sheet_text(file_bytes: bytes, requested_sheet_name: str) -> str | None:
-    """Extract only the explicitly requested worksheet, matching its name exactly."""
+    """Extract the requested sub-sheet/worksheet with exact, ordinal, or substring matching."""
     import openpyxl
+    import re
 
     workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
-    target_name = " ".join(requested_sheet_name.casefold().split())
+    clean_req = requested_sheet_name.strip()
+    target_name = " ".join(clean_req.casefold().split())
+
+    # 1. Exact case-insensitive match
     actual_name = next(
         (
             name
@@ -428,13 +478,41 @@ def extract_excel_sheet_text(file_bytes: bytes, requested_sheet_name: str) -> st
         ),
         None,
     )
+
+    # 2. Check for ordinal sheet references ("first", "second", "1", "2", "last", etc.)
+    if actual_name is None and workbook.sheetnames:
+        ord_map = {
+            "first": 0, "1st": 0, "1": 0, "one": 0,
+            "second": 1, "2nd": 1, "2": 1, "two": 1,
+            "third": 2, "3rd": 2, "3": 2, "three": 2,
+            "fourth": 3, "4th": 3, "4": 3, "four": 3,
+            "fifth": 4, "5th": 4, "5": 4, "five": 4,
+            "last": -1, "final": -1,
+        }
+        for token, idx in ord_map.items():
+            if re.search(r"\b" + re.escape(token) + r"\b", target_name):
+                if -len(workbook.sheetnames) <= idx < len(workbook.sheetnames):
+                    actual_name = workbook.sheetnames[idx]
+                    break
+
+    # 3. Substring match (e.g. "sales" matches "Sales Data" or "2024_Sales")
+    if actual_name is None:
+        actual_name = next(
+            (
+                name
+                for name in workbook.sheetnames
+                if target_name in name.casefold() or name.casefold() in target_name
+            ),
+            None,
+        )
+
     if actual_name is None:
         workbook.close()
         return None
 
     worksheet = workbook[actual_name]
-    lines = [f"[Sheet: {actual_name}]"]
-    for row in worksheet.iter_rows(max_row=300, values_only=True):
+    lines = [f"[Sub-Sheet: {actual_name}]"]
+    for row in worksheet.iter_rows(max_row=1000, values_only=True):
         values = [str(cell) if cell is not None else "" for cell in row]
         if any(value.strip() for value in values):
             lines.append(" | ".join(values))

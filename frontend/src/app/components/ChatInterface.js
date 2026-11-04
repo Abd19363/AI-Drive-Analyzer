@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import {
   Send,
   Square,
@@ -15,9 +15,16 @@ import {
   ThumbsUp,
   X,
   ChevronRight,
-  FileCheck2
+  FileCheck2,
+  MessageSquare,
+  Plus,
+  Trash2,
+  RotateCcw,
+  ChevronDown,
 } from "lucide-react";
 import MarkdownRenderer from "./MarkdownRenderer";
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
 const PIPELINE_STEPS = [
   { key: "ANALYZING", stepNum: "1", label: "Finding Relevant Files" },
@@ -40,8 +47,21 @@ function getStepState(stepKey, currentStep) {
   return "idle";
 }
 
+const DEFAULT_WELCOME_MESSAGE = {
+  id: "welcome-1",
+  sender: "ai",
+  text: "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
+  time: "Just now",
+  showSecurityNotice: true,
+  citations: [],
+  blockedFiles: [],
+};
+
 export default function ChatInterface({
+  userId,
+  portalEmail,
   onAskQuestion,
+  onResponseDisplayed,
   onCancelQuery,
   onRecordFallbackDecision,
   isProcessing,
@@ -50,20 +70,121 @@ export default function ChatInterface({
   selectedFileIds = [],
   onDeselectFile,
 }) {
-  const [messages, setMessages] = useState([
-    {
-      id: "welcome-1",
-      sender: "ai",
-      text: "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
-      time: "Just now",
-      showSecurityNotice: true,
-      citations: [],
-      blockedFiles: [],
-    },
-  ]);
+  const [messages, setMessages] = useState([DEFAULT_WELCOME_MESSAGE]);
   const [inputQuery, setInputQuery] = useState("");
   const [copiedId, setCopiedId] = useState(null);
   const messagesEndRef = useRef(null);
+
+  // Sessions State
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [isSessionMenuOpen, setIsSessionMenuOpen] = useState(false);
+  const sessionMenuRef = useRef(null);
+
+  // Close session dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (sessionMenuRef.current && !sessionMenuRef.current.contains(event.target)) {
+        setIsSessionMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // 1. Zero-delay Hydration from localStorage on mount
+  useEffect(() => {
+    if (!userId || typeof window === "undefined") return;
+    try {
+      const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}`);
+      if (savedSessionId) {
+        setActiveSessionId(savedSessionId);
+        const cached = localStorage.getItem(`ai_drive_session_msgs_${savedSessionId}`);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setMessages(parsed);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[Chat] Error reading localStorage session cache:", e);
+    }
+  }, [userId]);
+
+  // 2. Fetch Sessions List & sync with server
+  const loadSessions = useCallback(async () => {
+    if (!userId) return;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/rag/sessions?user_id=${userId}`);
+      if (res.ok) {
+        const data = await res.json();
+        const sessionList = data.sessions || [];
+        setSessions(sessionList);
+
+        if (sessionList.length > 0) {
+          const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}`);
+          const targetSession = sessionList.find((s) => s.id === savedSessionId) || sessionList[0];
+          setActiveSessionId(targetSession.id);
+          localStorage.setItem(`ai_drive_active_session_${userId}`, targetSession.id);
+
+          // Fetch full messages from server for target session
+          const msgUrl = userId
+            ? `${BACKEND_URL}/api/rag/sessions/${targetSession.id}?user_id=${encodeURIComponent(userId)}`
+            : `${BACKEND_URL}/api/rag/sessions/${targetSession.id}`;
+          const msgRes = await fetch(msgUrl);
+          if (msgRes.ok) {
+            const sData = await msgRes.json();
+            if (Array.isArray(sData.messages) && sData.messages.length > 0) {
+              setMessages(sData.messages);
+              localStorage.setItem(`ai_drive_session_msgs_${targetSession.id}`, JSON.stringify(sData.messages));
+            }
+          }
+        } else {
+          // User has no sessions in DB; initialize the first one
+          await createNewSession("New Chat");
+        }
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to load sessions from server:", err);
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (userId) {
+      loadSessions();
+    }
+  }, [userId, loadSessions]);
+
+  // 3. Auto-save messages to localStorage & sync to backend whenever messages change
+  useEffect(() => {
+    if (!activeSessionId || messages.length === 0 || typeof window === "undefined") return;
+    try {
+      localStorage.setItem(`ai_drive_session_msgs_${activeSessionId}`, JSON.stringify(messages));
+    } catch (e) {
+      console.error("[Chat] Failed to store messages locally:", e);
+    }
+
+    if (userId) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        fetch(`${BACKEND_URL}/api/rag/sessions/${activeSessionId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: userId,
+            messages: messages,
+          }),
+          signal: controller.signal,
+        }).catch(() => {});
+      }, 600);
+
+      return () => {
+        clearTimeout(timer);
+        controller.abort();
+      };
+    }
+  }, [messages, activeSessionId, userId]);
 
   // Auto-scroll to bottom whenever messages change or processing state changes
   useEffect(() => {
@@ -76,10 +197,237 @@ export default function ChatInterface({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const reportResponseDisplayed = async (queryId, startedAt, status) => {
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+    try {
+      await onResponseDisplayed?.(
+        queryId,
+        performance.now() - startedAt,
+        status
+      );
+    } catch (err) {
+      console.error("[Chat] Failed to report response display time:", err);
+    }
+  };
+
+  // Create a new session
+  const createNewSession = async (title = "New Chat") => {
+    if (!userId) return;
+    const initialMsgs = [
+      {
+        ...DEFAULT_WELCOME_MESSAGE,
+        id: `welcome-${Date.now()}`,
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      },
+    ];
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/rag/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          title: title,
+          messages: initialMsgs,
+        }),
+      });
+      if (res.ok) {
+        const newSession = await res.json();
+        setSessions((prev) => [newSession, ...prev]);
+        setActiveSessionId(newSession.id);
+        setMessages(initialMsgs);
+        localStorage.setItem(`ai_drive_active_session_${userId}`, newSession.id);
+        localStorage.setItem(`ai_drive_session_msgs_${newSession.id}`, JSON.stringify(initialMsgs));
+        setIsSessionMenuOpen(false);
+        return newSession;
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to create new session:", err);
+    }
+  };
+
+  // Select an existing session
+  const handleSelectSession = async (sessionId) => {
+    if (sessionId === activeSessionId) {
+      setIsSessionMenuOpen(false);
+      return;
+    }
+    setActiveSessionId(sessionId);
+    localStorage.setItem(`ai_drive_active_session_${userId}`, sessionId);
+    setIsSessionMenuOpen(false);
+
+    // Read cached messages immediately
+    const cached = localStorage.getItem(`ai_drive_session_msgs_${sessionId}`);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+        }
+      } catch (e) {}
+    }
+
+    // Refresh from server
+    try {
+      const url = userId
+        ? `${BACKEND_URL}/api/rag/sessions/${sessionId}?user_id=${encodeURIComponent(userId)}`
+        : `${BACKEND_URL}/api/rag/sessions/${sessionId}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.messages) && data.messages.length > 0) {
+          setMessages(data.messages);
+          localStorage.setItem(`ai_drive_session_msgs_${sessionId}`, JSON.stringify(data.messages));
+        }
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to fetch session messages:", err);
+    }
+  };
+
+  // Delete a session
+  const handleDeleteSession = async (e, sessionId) => {
+    e.stopPropagation();
+    try {
+      const url = userId
+        ? `${BACKEND_URL}/api/rag/sessions/${sessionId}?user_id=${encodeURIComponent(userId)}`
+        : `${BACKEND_URL}/api/rag/sessions/${sessionId}`;
+      const res = await fetch(url, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        localStorage.removeItem(`ai_drive_session_msgs_${sessionId}`);
+        const remaining = sessions.filter((s) => s.id !== sessionId);
+
+        if (remaining.length > 0) {
+          setSessions(remaining);
+          if (activeSessionId === sessionId) {
+            const nextSession = remaining[0];
+            setActiveSessionId(nextSession.id);
+            localStorage.setItem(`ai_drive_active_session_${userId}`, nextSession.id);
+            // Fetch messages for next active session
+            try {
+              const nextMsgUrl = userId
+                ? `${BACKEND_URL}/api/rag/sessions/${nextSession.id}?user_id=${encodeURIComponent(userId)}`
+                : `${BACKEND_URL}/api/rag/sessions/${nextSession.id}`;
+              const nextRes = await fetch(nextMsgUrl);
+              if (nextRes.ok) {
+                const nextData = await nextRes.json();
+                const msgs = Array.isArray(nextData.messages) && nextData.messages.length > 0
+                  ? nextData.messages
+                  : [
+                      {
+                        ...DEFAULT_WELCOME_MESSAGE,
+                        id: `welcome-${Date.now()}`,
+                        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+                      },
+                    ];
+                setMessages(msgs);
+                localStorage.setItem(`ai_drive_session_msgs_${nextSession.id}`, JSON.stringify(msgs));
+              }
+            } catch (err) {
+              console.error("[Chat] Failed to load next session messages:", err);
+            }
+          }
+        } else {
+          // If NO sessions remain: reset view and create a single clean session
+          const initialMsgs = [
+            {
+              ...DEFAULT_WELCOME_MESSAGE,
+              id: `welcome-${Date.now()}`,
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            },
+          ];
+          setMessages(initialMsgs);
+          if (userId) {
+            try {
+              const createRes = await fetch(`${BACKEND_URL}/api/rag/sessions`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  user_id: userId,
+                  title: "New Chat",
+                  messages: initialMsgs,
+                }),
+              });
+              if (createRes.ok) {
+                const freshSession = await createRes.json();
+                setSessions([freshSession]);
+                setActiveSessionId(freshSession.id);
+                localStorage.setItem(`ai_drive_active_session_${userId}`, freshSession.id);
+                localStorage.setItem(`ai_drive_session_msgs_${freshSession.id}`, JSON.stringify(initialMsgs));
+              } else {
+                setSessions([]);
+                setActiveSessionId(null);
+              }
+            } catch (e) {
+              setSessions([]);
+              setActiveSessionId(null);
+            }
+          } else {
+            setSessions([]);
+            setActiveSessionId(null);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to delete session:", err);
+    }
+  };
+
+  // Explicit Clear Chat button
+  const handleClearChat = async () => {
+    const clearedMessages = [
+      {
+        ...DEFAULT_WELCOME_MESSAGE,
+        id: `welcome-${Date.now()}`,
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      },
+    ];
+    setMessages(clearedMessages);
+    if (activeSessionId) {
+      localStorage.setItem(`ai_drive_session_msgs_${activeSessionId}`, JSON.stringify(clearedMessages));
+      try {
+        const url = userId
+          ? `${BACKEND_URL}/api/rag/sessions/${activeSessionId}/clear?user_id=${encodeURIComponent(userId)}`
+          : `${BACKEND_URL}/api/rag/sessions/${activeSessionId}/clear`;
+        await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        console.error("[Chat] Failed to clear chat on backend:", err);
+      }
+    }
+  };
+
+  // Auto-name session from first query
+  const checkAndUpdateSessionTitle = (queryText) => {
+    if (!activeSessionId) return;
+    const currentSession = sessions.find((s) => s.id === activeSessionId);
+    if (currentSession && (currentSession.title === "New Chat" || !currentSession.title)) {
+      const cleanTitle = queryText.length > 35 ? queryText.slice(0, 32).trim() + "..." : queryText.trim();
+      setSessions((prev) =>
+        prev.map((s) => (s.id === activeSessionId ? { ...s, title: cleanTitle } : s))
+      );
+      fetch(`${BACKEND_URL}/api/rag/sessions/${activeSessionId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          title: cleanTitle,
+        }),
+      }).catch(() => {});
+    }
+  };
+
   const handleSend = async (e) => {
     if (e) e.preventDefault();
     if (!inputQuery.trim() || isProcessing) return;
 
+    const startedAt = performance.now();
+    const queryId = crypto.randomUUID();
     const userText = inputQuery.trim();
     setInputQuery("");
 
@@ -99,10 +447,19 @@ export default function ChatInterface({
       },
     ]);
 
+    checkAndUpdateSessionTitle(userText);
     console.log("[Chat] Sending query:", userText);
 
     try {
-      const response = await onAskQuestion(userText, selectedFileIds);
+      const response = await onAskQuestion(
+        userText,
+        selectedFileIds,
+        false,
+        [],
+        false,
+        queryId,
+        activeSessionId
+      );
       console.log("[RAG Response]", response);
       setMessages((prev) => [
         ...prev,
@@ -123,6 +480,7 @@ export default function ChatInterface({
           intent: response?.intent || "general",
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "success");
     } catch (err) {
       if (err.name === "AbortError") {
         setMessages((prev) => [
@@ -137,6 +495,7 @@ export default function ChatInterface({
             candidateFiles: [],
           },
         ]);
+        await reportResponseDisplayed(queryId, startedAt, "cancelled");
         return;
       }
       console.error("[Chat] Query error:", err);
@@ -153,6 +512,7 @@ export default function ChatInterface({
           candidateFiles: [],
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "error");
     }
   };
 
@@ -190,6 +550,8 @@ export default function ChatInterface({
       hour: "2-digit",
       minute: "2-digit",
     });
+    const startedAt = performance.now();
+    const queryId = crypto.randomUUID();
     setMessages((prev) => [
       ...prev.map((item) =>
         item.id === message.id
@@ -209,7 +571,10 @@ export default function ChatInterface({
         message.originalQuery,
         message.originalFileIds,
         true,
-        message.matchedFileIds || []
+        message.matchedFileIds || [],
+        false,
+        queryId,
+        activeSessionId
       );
       setMessages((prev) => [
         ...prev,
@@ -227,6 +592,7 @@ export default function ChatInterface({
           originalFileIds: message.originalFileIds,
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "success");
     } catch (err) {
       console.error("[Chat] General answer error:", err);
       setMessages((prev) => [
@@ -239,11 +605,14 @@ export default function ChatInterface({
           isError: true,
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "error");
     }
   };
 
   const handleForceDriveSearch = async (message) => {
     if (isProcessing) return;
+    const startedAt = performance.now();
+    const queryId = crypto.randomUUID();
     const timeStr = new Date().toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
@@ -263,7 +632,9 @@ export default function ChatInterface({
         message.originalFileIds || [],
         false,
         message.matchedFileIds || [],
-        true
+        true,
+        queryId,
+        activeSessionId
       );
       setMessages((prev) => [
         ...prev,
@@ -277,12 +648,12 @@ export default function ChatInterface({
           autoDiscovered: response?.auto_discovered || false,
           candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
           answerSource: response?.answer_source,
-          needsGeneralConfirmation: response?.needs_general_confirmation || false,
           originalQuery: message.originalQuery,
           originalFileIds: message.originalFileIds,
           fromDriveSearch: true,
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "success");
     } catch (err) {
       console.error("[Chat] Force Drive search error:", err);
       setMessages((prev) => [
@@ -295,13 +666,105 @@ export default function ChatInterface({
           isError: true,
         },
       ]);
+      await reportResponseDisplayed(queryId, startedAt, "error");
     }
   };
 
+  const currentSessionTitle = sessions.find((s) => s.id === activeSessionId)?.title || "Active Chat";
+
   return (
     <div className="bg-white border border-slate-200/80 rounded-2xl shadow-xs flex flex-col h-[700px] overflow-hidden">
+      {/* 0. Top Chat Sessions Navigation Bar */}
+      <div className="px-6 py-2.5 border-b border-slate-100 flex items-center justify-between gap-3 bg-slate-50/60">
+        <div className="relative" ref={sessionMenuRef}>
+          <button
+            type="button"
+            onClick={() => setIsSessionMenuOpen(!isSessionMenuOpen)}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200/90 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 transition-all shadow-2xs cursor-pointer"
+            title="Switch chat session"
+          >
+            <MessageSquare size={13} className="text-blue-600 flex-shrink-0" />
+            <span className="truncate max-w-[180px] sm:max-w-[240px]">
+              {currentSessionTitle}
+            </span>
+            <ChevronDown size={13} className="text-slate-400 flex-shrink-0" />
+          </button>
+
+          {isSessionMenuOpen && (
+            <div className="absolute left-0 mt-1.5 w-72 bg-white border border-slate-200 rounded-xl shadow-lg z-50 py-1.5 animate-fade-in">
+              <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between border-b border-slate-100">
+                <span>Chat Sessions ({sessions.length})</span>
+                <button
+                  type="button"
+                  onClick={() => createNewSession("New Chat")}
+                  className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium normal-case cursor-pointer"
+                >
+                  <Plus size={12} /> New
+                </button>
+              </div>
+              <div className="max-h-60 overflow-y-auto py-1">
+                {sessions.map((sess) => {
+                  const isActive = sess.id === activeSessionId;
+                  return (
+                    <div
+                      key={sess.id}
+                      onClick={() => handleSelectSession(sess.id)}
+                      className={`px-3 py-2 flex items-center justify-between cursor-pointer transition-colors ${
+                        isActive ? "bg-blue-50 text-blue-900 font-semibold" : "hover:bg-slate-50 text-slate-700"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0 pr-2">
+                        <MessageSquare size={12} className={isActive ? "text-blue-600" : "text-slate-400"} />
+                        <span className="text-xs truncate">{sess.title || "Untitled Chat"}</span>
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        {sess.message_count > 0 && (
+                          <span className="text-[10px] text-slate-400 px-1 rounded bg-slate-100">
+                            {sess.message_count}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteSession(e, sess.id)}
+                          className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors"
+                          title="Delete session"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => createNewSession("New Chat")}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200/90 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition-colors shadow-2xs cursor-pointer"
+            title="Create a new chat session"
+          >
+            <Plus size={13} className="text-blue-600" />
+            <span className="hidden sm:inline">New Chat</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleClearChat}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200/90 bg-white hover:bg-rose-50 hover:border-rose-200 hover:text-rose-700 text-xs font-medium text-slate-600 transition-colors shadow-2xs cursor-pointer"
+            title="Clear current chat messages"
+          >
+            <RotateCcw size={12} />
+            <span className="hidden sm:inline">Clear Chat</span>
+          </button>
+        </div>
+      </div>
+
       {/* 1. Stepper Bar (matching exact design in screenshot) */}
-      <div className="px-6 pt-5 pb-2">
+      <div className="px-6 pt-3 pb-2">
         <div className="flex items-center gap-2 overflow-x-auto scrollbar-none py-1">
           {PIPELINE_STEPS.map((step, idx) => {
             const state = getStepState(step.key, currentStep);
@@ -461,7 +924,7 @@ export default function ChatInterface({
                         type="button"
                         disabled={isProcessing}
                         onClick={() => handleForceDriveSearch(msg)}
-                        className="inline-flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-800 hover:underline"
+                        className="inline-flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
                       >
                         <Search size={11} />
                         Search Drive documents instead
@@ -475,7 +938,7 @@ export default function ChatInterface({
                         type="button"
                         disabled={isProcessing}
                         onClick={() => handleGeneralConfirmation(msg, true)}
-                        className="rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                        className="rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
                       >
                         Yes, answer generally
                       </button>
@@ -483,7 +946,7 @@ export default function ChatInterface({
                         type="button"
                         disabled={isProcessing}
                         onClick={() => handleGeneralConfirmation(msg, false)}
-                        className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                        className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                       >
                         No, clarify query
                       </button>
@@ -536,7 +999,7 @@ export default function ChatInterface({
                       <button
                         type="button"
                         onClick={() => handleCopy(msg.id, msg.text)}
-                        className="p-1 rounded hover:bg-slate-100 hover:text-slate-600 transition-colors"
+                        className="p-1 rounded hover:bg-slate-100 hover:text-slate-600 transition-colors cursor-pointer"
                         title="Copy answer"
                       >
                         {copiedId === msg.id ? (
@@ -547,7 +1010,7 @@ export default function ChatInterface({
                       </button>
                       <button
                         type="button"
-                        className="p-1 rounded hover:bg-slate-100 hover:text-slate-600 transition-colors"
+                        className="p-1 rounded hover:bg-slate-100 hover:text-slate-600 transition-colors cursor-pointer"
                         title="Helpful"
                       >
                         <ThumbsUp size={12} />
@@ -572,7 +1035,7 @@ export default function ChatInterface({
               <button
                 type="button"
                 onClick={onCancelQuery}
-                className="ml-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-rose-600 hover:bg-rose-50"
+                className="ml-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-rose-600 hover:bg-rose-50 cursor-pointer"
                 title="Cancel the current query"
               >
                 <Square size={10} fill="currentColor" />
@@ -582,6 +1045,21 @@ export default function ChatInterface({
             <p className="mt-1 ml-5 text-[10px] leading-relaxed text-slate-400">
               First-time checks and indexing can take longer. Safe files are indexed to speed up follow-up questions.
             </p>
+          </div>
+        )}
+
+        {/* Clear Chat Button at the end of each chat */}
+        {messages.length > 1 && (
+          <div className="flex justify-center my-3 animate-fade-in">
+            <button
+              type="button"
+              onClick={handleClearChat}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-medium text-slate-500 bg-slate-100 hover:bg-slate-200 hover:text-rose-600 border border-slate-200/80 transition-all shadow-2xs cursor-pointer"
+              title="Clear all messages in this chat session"
+            >
+              <RotateCcw size={12} />
+              <span>Clear Chat</span>
+            </button>
           </div>
         )}
 
@@ -635,7 +1113,7 @@ export default function ChatInterface({
               key={suggestion}
               type="button"
               onClick={() => handleSuggestionClick(suggestion)}
-              className="text-[11px] text-slate-600 bg-white border border-slate-200/80 hover:border-slate-300 hover:bg-slate-50 px-2.5 py-0.5 rounded-full shadow-2xs transition-colors flex-shrink-0"
+              className="text-[11px] text-slate-600 bg-white border border-slate-200/80 hover:border-slate-300 hover:bg-slate-50 px-2.5 py-0.5 rounded-full shadow-2xs transition-colors flex-shrink-0 cursor-pointer"
             >
               {suggestion}
             </button>

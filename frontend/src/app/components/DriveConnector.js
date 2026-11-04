@@ -4,6 +4,8 @@ import { HardDrive, ArrowRight, ShieldCheck, Sparkles, CheckCircle2, LogOut, Loa
 
 export default function DriveConnector({
   isConnected,
+  portalEmail,
+  googleEmail,
   userEmail,
   onConnect,
   onDisconnect,
@@ -27,8 +29,15 @@ export default function DriveConnector({
                 Active
               </span>
             </div>
-            {userEmail && (
-              <p className="text-xs text-slate-500 truncate mt-0.5">{userEmail}</p>
+            {(googleEmail || userEmail) && (
+              <p className="text-xs text-slate-600 truncate mt-0.5">
+                Connected Drive: <span className="font-semibold text-slate-900">{googleEmail || userEmail}</span>
+              </p>
+            )}
+            {portalEmail && (
+              <p className="text-[11px] text-slate-400 truncate">
+                User Portal Account: {portalEmail}
+              </p>
             )}
           </div>
         </div>
@@ -77,10 +86,15 @@ export default function DriveConnector({
             Connect Your Google Drive
           </h2>
           <p className="text-xs text-slate-500 mt-0.5 leading-relaxed max-w-2xl">
-            Authorize secure read-only access to query your documents.{" "}
-            <strong className="text-slate-800 font-semibold">Your documents remain private</strong>
-            {" "}— files are processed securely only when you ask questions, protected by automated privacy and confidentiality screening.
+            Choose any Google Drive account of your choice to link with this session.{" "}
+            <strong className="text-slate-800 font-semibold">Your files remain strictly private</strong>
+            {" "}— processed securely only when you ask questions.
           </p>
+          {portalEmail && (
+            <p className="text-[11px] text-slate-400 mt-1">
+              Portal Login: <span className="font-medium text-slate-600">{portalEmail}</span> (You can connect any Google email address of your choice).
+            </p>
+          )}
         </div>
       </div>
 

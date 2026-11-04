@@ -79,9 +79,9 @@ async def handle_oauth_callback(code: str, db: AsyncSession, state: str = None):
 
     user = target_user
 
-    # Find or update GoogleAccount
+    # Find or update GoogleAccount for this user
     acc_result = await db.execute(
-        select(GoogleAccount).where(GoogleAccount.user_id == user.id, GoogleAccount.google_user_id == google_id)
+        select(GoogleAccount).where(GoogleAccount.user_id == user.id)
     )
     google_acc = acc_result.scalars().first()
 
@@ -102,6 +102,8 @@ async def handle_oauth_callback(code: str, db: AsyncSession, state: str = None):
         )
         db.add(google_acc)
     else:
+        google_acc.google_user_id = google_id
+        google_acc.email = email
         google_acc.access_token = credentials.token
         if credentials.refresh_token:
             google_acc.refresh_token = credentials.refresh_token

@@ -257,7 +257,10 @@ def download_file(google_account: GoogleAccount, file_id: str, mime_type: str) -
     if mime_type == "application/vnd.google-apps.document":
         request = service.files().export_media(fileId=file_id, mimeType="application/pdf")
     elif mime_type == "application/vnd.google-apps.spreadsheet":
-        request = service.files().export_media(fileId=file_id, mimeType="text/csv")
+        request = service.files().export_media(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     elif mime_type == "application/vnd.google-apps.presentation":
         request = service.files().export_media(fileId=file_id, mimeType="application/pdf")
     elif mime_type == "application/vnd.google-apps.folder":

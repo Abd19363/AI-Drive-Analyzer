@@ -40,6 +40,24 @@ async def lifespan(app: FastAPI):
                 ALTER TABLE drive_files
                 ADD COLUMN IF NOT EXISTS extraction_version INTEGER NOT NULL DEFAULT 0;
             """))
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    title VARCHAR(255) NOT NULL DEFAULT 'New Chat',
+                    messages JSONB DEFAULT '[]'::jsonb,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_sessions_created_at ON chat_sessions(created_at);"))
+            await conn.execute(text("ALTER TABLE chat_queries ADD COLUMN IF NOT EXISTS session_id UUID REFERENCES chat_sessions(id) ON DELETE SET NULL;"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS assigned_tokens INTEGER NOT NULL DEFAULT 50000;"))
+            await conn.execute(text("ALTER TABLE chat_queries ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER NOT NULL DEFAULT 0;"))
+            await conn.execute(text("ALTER TABLE chat_queries ADD COLUMN IF NOT EXISTS completion_tokens INTEGER NOT NULL DEFAULT 0;"))
+            await conn.execute(text("ALTER TABLE chat_queries ADD COLUMN IF NOT EXISTS total_tokens INTEGER NOT NULL DEFAULT 0;"))
             # Ensure PostgreSQL Trigger permanently protects Lead Admin from DELETE:
             await conn.execute(text("""
                 CREATE OR REPLACE FUNCTION protect_lead_admin_from_delete()

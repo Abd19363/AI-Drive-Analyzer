@@ -1,13 +1,16 @@
 import asyncio
 import logging
 import time
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from typing import Any, Dict, Optional, List
+import uuid
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional, List, Literal
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.db import get_db
-from app.models import GoogleAccount, ChatQuery, QueryTelemetry, User
+from app.models import GoogleAccount, ChatQuery, QueryTelemetry, User, ChatSession
 from app.services.drive_service import get_cached_file_catalog, list_files_cached
 from app.services.gemini_service import (
     GeminiServiceUnavailableError,
@@ -16,7 +19,6 @@ from app.services.gemini_service import (
     synthesize_answer,
 )
 from app.services.rag_workflow import (
-    _get_full_document_texts,
     create_rag_graph,
     search_cached_user_documents,
 )
@@ -29,10 +31,13 @@ from app.services.query_intent_service import (
     is_drive_inventory_query,
     extract_drive_inventory_target,
     clean_response_text,
+    is_constituency_data_query,
+    filter_files_by_query_scope,
     _DOCUMENT_REQUEST_PATTERN,
     _DOCUMENT_SEARCH_PATTERN,
     _PERSONAL_CONTEXT_PATTERN,
     _BUSINESS_DATA_PATTERN,
+    _EXPLICIT_GENERAL_PATTERN,
 )
 from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE
 from app.services.query_cache_service import (
@@ -53,10 +58,23 @@ class QuestionRequest(BaseModel):
     query: str
     selected_file_ids: Optional[List[str]] = None
     query_id: Optional[str] = None
+    session_id: Optional[str] = None
     allow_general_answer: bool = False
     matched_file_ids: Optional[List[str]] = None
     force_drive_search: bool = False
     intent: Optional[QueryIntent] = None
+
+
+class CreateSessionRequest(BaseModel):
+    user_id: str
+    title: Optional[str] = "New Chat"
+    messages: Optional[List[Dict[str, Any]]] = None
+
+
+class UpdateSessionRequest(BaseModel):
+    user_id: str
+    title: Optional[str] = None
+    messages: Optional[List[Dict[str, Any]]] = None
 
 
 class QueryIntentRequest(BaseModel):
@@ -79,6 +97,13 @@ class QueryDecisionRequest(BaseModel):
 class CancelQueryRequest(BaseModel):
     user_id: str
     query_id: str
+
+
+class DisplayedResponseTimingRequest(BaseModel):
+    query_id: str
+    elapsed_ms: float = Field(ge=0, le=86_400_000)
+    status: Literal["success", "error", "cancelled"]
+
 
 # Instantiate the compiled LangGraph
 rag_graph = create_rag_graph()
@@ -119,63 +144,52 @@ async def _resolve_query_route(
         matched_file_ids,
     )
 
+    if not selected_file_ids and not matched_file_ids:
+        matched_file_ids = await _find_drive_name_matches(db, query, user_id)
+        if matched_file_ids:
+            logger.info(
+                "[RAG] Drive catalog name match found %d file/folder candidate(s) "
+                "before intent routing",
+                len(matched_file_ids),
+            )
+            if intent in {
+                "capabilities",
+                "assistant_info",
+                "direct_answer",
+                "media",
+            }:
+                intent = classify_query_intent(query, has_selected_files=True)
+                if intent in {
+                    "capabilities",
+                    "assistant_info",
+                    "direct_answer",
+                    "media",
+                }:
+                    intent = "fact"
+            return intent, matched_file_ids
+
+    if force_drive_search and intent in {
+        "capabilities",
+        "assistant_info",
+        "direct_answer",
+        "media",
+    }:
+        intent = "fact"
+
+    if (
+        not force_drive_search
+        and not selected_file_ids
+        and not matched_file_ids
+        and is_constituency_data_query(query)
+    ):
+        return intent, []
+
     if not force_drive_search and not selected_file_ids and not matched_file_ids:
         if is_fast_general_knowledge_query(query):
             return "direct_answer", []
 
         if intent in {"capabilities", "assistant_info", "direct_answer", "media", "drive_inventory"}:
             return intent, []
-
-    google_account = None
-    available_files = None
-    title_matches = []
-    if not selected_file_ids and not matched_file_ids:
-        account_result = await db.execute(
-            select(GoogleAccount).where(GoogleAccount.user_id == user_id)
-        )
-        google_account = account_result.scalars().first()
-        if google_account:
-            available_files = get_cached_file_catalog(
-                google_account,
-                page_size=100,
-                expand_folders=True,
-            )
-            if not available_files:
-                try:
-                    available_files = await asyncio.to_thread(
-                        list_files_cached,
-                        google_account,
-                        page_size=100,
-                        expand_folders=True,
-                    )
-                except Exception as exc:
-                    logger.exception("[RAG] Failed to load the expanded Drive catalog.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Could not search all Google Drive folders. Please retry.",
-                    ) from exc
-
-            if available_files:
-                strong_title_matches = match_files_by_title(
-                    query,
-                    available_files,
-                    minimum_score=20,
-                )
-                if strong_title_matches:
-                    strong_ids = [
-                        file_info["id"]
-                        for file_info in strong_title_matches
-                        if file_info.get("id")
-                    ]
-                    logger.info(
-                        "[RAG] Strong filename match routed query directly to %d file(s), skipping general-vs-Drive classification.",
-                        len(strong_ids),
-                    )
-                    return (
-                        _classify_request_intent(query, selected_file_ids, strong_ids),
-                        strong_ids,
-                    )
-                title_matches = match_files_by_title(query, available_files)
 
     if not force_drive_search and not selected_file_ids and not matched_file_ids:
         has_doc_indicators = (
@@ -184,20 +198,114 @@ async def _resolve_query_route(
             or bool(_PERSONAL_CONTEXT_PATTERN.search(query))
             or bool(_BUSINESS_DATA_PATTERN.search(query))
         )
-        if not has_doc_indicators and await classify_general_vs_drive_query(query, available_files):
+        if not has_doc_indicators and await classify_general_vs_drive_query(query):
             return "direct_answer", []
 
-    if not selected_file_ids and not matched_file_ids:
-        matched_file_ids = [
-            file_info["id"]
-            for file_info in title_matches
-            if file_info.get("id")
-        ]
-
-    return (
-        _classify_request_intent(query, selected_file_ids, matched_file_ids),
-        matched_file_ids,
+    resolved_intent = classify_query_intent(
+        query,
+        has_selected_files=bool(
+            selected_file_ids or matched_file_ids or force_drive_search
+        ),
     )
+    if force_drive_search and resolved_intent in {
+        "capabilities",
+        "assistant_info",
+        "direct_answer",
+        "media",
+    }:
+        resolved_intent = "fact"
+    return resolved_intent, matched_file_ids
+
+
+async def _find_drive_name_matches(
+    db: AsyncSession,
+    query: str,
+    user_id: str,
+) -> List[str]:
+    account_result = await db.execute(
+        select(GoogleAccount).where(GoogleAccount.user_id == user_id)
+    )
+    google_account = account_result.scalars().first()
+    if not google_account:
+        return []
+
+    available_files = get_cached_file_catalog(
+        google_account,
+        page_size=100,
+        expand_folders=True,
+    )
+    if available_files is None:
+        try:
+            available_files = await asyncio.to_thread(
+                list_files_cached,
+                google_account,
+                page_size=100,
+                expand_folders=True,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[RAG] Could not check Drive names before intent routing."
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Could not check Google Drive file and folder names before "
+                    "answering. Please retry after reconnecting Drive."
+                ),
+            ) from exc
+
+    matches = match_files_by_title(query, available_files or [], minimum_score=15)
+    matches = filter_files_by_query_scope(query, matches)
+    if not matches:
+        return []
+
+    from app.services.guardrail_service import is_media_file
+
+    catalog_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for f in (available_files or []):
+        pid = f.get("parent_id")
+        if pid:
+            catalog_by_parent.setdefault(pid, []).append(f)
+
+    prioritized_ids: List[str] = []
+    seen_ids = set()
+
+    for item in matches:
+        is_folder = (
+            item.get("mimeType") == "application/vnd.google-apps.folder"
+            or item.get("is_folder", False)
+        )
+        if is_folder:
+            f_id = item.get("id")
+            if not f_id:
+                continue
+            pending = [f_id]
+            visited = set()
+            while pending:
+                curr = pending.pop()
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                for child in catalog_by_parent.get(curr, []):
+                    child_is_fld = (
+                        child.get("mimeType") == "application/vnd.google-apps.folder"
+                        or child.get("is_folder", False)
+                    )
+                    child_id = child.get("id")
+                    if child_is_fld:
+                        if child_id:
+                            pending.append(child_id)
+                    elif not is_media_file(child):
+                        if child_id and child_id not in seen_ids:
+                            seen_ids.add(child_id)
+                            prioritized_ids.append(str(child_id))
+        else:
+            fid = item.get("id")
+            if fid and fid not in seen_ids and not is_media_file(item):
+                seen_ids.add(fid)
+                prioritized_ids.append(str(fid))
+
+    return prioritized_ids
 
 
 def _handle_drive_inventory_query(
@@ -358,6 +466,9 @@ async def _save_answer(
     source_file_names: Optional[List[str]] = None,
     document_versions: Optional[Dict[str, Optional[str]]] = None,
     sources: Optional[List[Dict[str, Any]]] = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
 ) -> None:
     primary_responding_file = (
         (source_file_names[0] if source_file_names else None)
@@ -371,6 +482,9 @@ async def _save_answer(
         source_file_names=source_file_names or [],
         responding_file_name=primary_responding_file,
         answer_text=answer,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens or (prompt_tokens + completion_tokens),
     ))
     await db.commit()
     await store_cached_answer(
@@ -606,9 +720,64 @@ async def classify_question(
 
 @router.post("/ask")
 async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_db)):
+    started_at = time.perf_counter()
+    try:
+        return await _ask_question_impl(payload, db)
+    finally:
+        logger.info(
+            "[RAG] Query response completed in %.3fs (query_id=%s)",
+            time.perf_counter() - started_at,
+            payload.query_id or "n/a",
+        )
+
+
+@router.post("/ask/displayed")
+async def log_ask_response_displayed(payload: DisplayedResponseTimingRequest):
+    logger.info(
+        "[RAG] End-to-end query time (submit-to-UI response): %.3fs "
+        "(status=%s, query_id=%s)",
+        payload.elapsed_ms / 1000,
+        payload.status,
+        payload.query_id,
+    )
+    return {"logged": True}
+
+
+async def _ask_question_impl(
+    payload: QuestionRequest,
+    db: AsyncSession = Depends(get_db),
+):
     query = payload.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    # Check token expiration & quota balance for user
+    if payload.user_id:
+        try:
+            user_uid = uuid.UUID(payload.user_id)
+            user_record = await db.get(User, user_uid)
+            if user_record:
+                now_utc = datetime.now(timezone.utc)
+                if user_record.token_expires_at and now_utc > user_record.token_expires_at:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Your token subscription has expired. Please contact the administrator to renew or update your token subscription.",
+                    )
+                # Check remaining tokens against total consumption
+                tokens_stmt = select(
+                    func.coalesce(func.sum(QueryTelemetry.total_tokens), 0)
+                ).where(
+                    QueryTelemetry.user_id == user_record.id,
+                )
+                t_res = await db.execute(tokens_stmt)
+                tokens_used_total = int(t_res.scalar() or 0)
+                if user_record.assigned_tokens > 0 and tokens_used_total >= user_record.assigned_tokens:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Your token quota has been exhausted. Please contact the administrator to allocate more tokens.",
+                    )
+        except ValueError:
+            pass
 
     started_at = time.perf_counter()
     selected_file_ids = payload.selected_file_ids or []
@@ -628,6 +797,16 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
             allow_general_answer=payload.allow_general_answer,
         )
         if cached_response:
+            latency_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                "[RAG] /ask early cache hit returned in %.3fs",
+                time.perf_counter() - started_at,
+            )
+            await _record_telemetry(
+                db, payload.user_id, latency_ms, cache_hit=True, api_called=False,
+                intent=initial_intent, prompt_tokens=0, completion_tokens=0,
+                query_id=payload.query_id
+            )
             return cached_response
 
         if payload.allow_general_answer:
@@ -652,6 +831,16 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
                     allow_general_answer=payload.allow_general_answer,
                 )
                 if cached_response:
+                    latency_ms = (time.perf_counter() - started_at) * 1000
+                    logger.info(
+                        "[RAG] /ask route cache hit returned in %.3fs",
+                        time.perf_counter() - started_at,
+                    )
+                    await _record_telemetry(
+                        db, payload.user_id, latency_ms, cache_hit=True, api_called=False,
+                        intent=intent, prompt_tokens=0, completion_tokens=0,
+                        query_id=payload.query_id
+                    )
                     return cached_response
     else:
         intent = payload.intent
@@ -674,6 +863,32 @@ async def ask_question(payload: QuestionRequest, db: AsyncSession = Depends(get_
                 intent=intent, query_id=payload.query_id
             )
             return cached_response
+        if (
+            not payload.allow_general_answer
+            and not selected_file_ids
+            and not matched_file_ids
+        ):
+            matched_file_ids = await _find_drive_name_matches(
+                db,
+                query,
+                payload.user_id,
+            )
+            if matched_file_ids:
+                payload.matched_file_ids = matched_file_ids
+                if intent in {
+                    "capabilities",
+                    "assistant_info",
+                    "direct_answer",
+                    "media",
+                }:
+                    intent = "fact"
+        if payload.force_drive_search and intent in {
+            "capabilities",
+            "assistant_info",
+            "direct_answer",
+            "media",
+        }:
+            intent = "fact"
 
     lock_key = cache_lock_key(
         payload.user_id,
@@ -859,42 +1074,47 @@ async def _ask_question_uncached(
         )
 
     if intent == "direct_answer":
-        try:
-            answer = await answer_general_query(query)
-        except GeminiServiceUnavailableError as e:
-            raise HTTPException(status_code=503, detail=str(e)) from e
-        await _save_answer(
-            db, user_id, query, answer, intent, "general",
-            selected_file_ids=selected_file_ids,
+        import re
+        is_greeting = bool(
+            re.match(
+                r"^\s*(?:hi|hello|hey|howdy|greetings|good\s+(?:morning|afternoon|evening|day)|how\s+are\s+you|who\s+are\s+you|tell\s+me\s+a\s+joke)\b[?.!]*\s*$",
+                query,
+                re.I,
+            )
         )
-        return _answer_response(
-            query,
-            intent,
-            answer,
-            analysis_required=False,
-            answer_source="general_knowledge",
-        )
+        is_explicit_general = bool(_EXPLICIT_GENERAL_PATTERN.search(query))
+        if is_greeting or is_explicit_general or payload.allow_general_answer:
+            try:
+                answer = await answer_general_query(query)
+            except GeminiServiceUnavailableError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+            await _save_answer(
+                db, user_id, query, answer, intent, "general",
+                selected_file_ids=selected_file_ids,
+            )
+            return _answer_response(
+                query,
+                intent,
+                answer,
+                analysis_required=False,
+                answer_source="general_knowledge",
+            )
 
     query_embedding_cache: Dict[str, List[float]] = {}
     cached_chunks = []
-    if not retrieval_file_ids:
-        try:
-            cached_chunks = await search_cached_user_documents(
-                db,
-                user_id,
-                query,
-                retrieval_file_ids,
-                query_embedding_cache=query_embedding_cache,
-            )
-        except Exception as exc:
-            logger.exception("Failed to search the indexed document cache.")
-            raise HTTPException(
-                status_code=500, detail="Failed to search the document cache."
-            ) from exc
+    try:
+        cached_chunks = await search_cached_user_documents(
+            db,
+            user_id,
+            query,
+            selected_file_ids=retrieval_file_ids if retrieval_file_ids else None,
+            query_embedding_cache=query_embedding_cache,
+        )
+    except Exception as exc:
+        logger.exception("Failed to search the indexed document cache.")
+        cached_chunks = []
 
-    # Explicit file scopes must pass through the live workflow so stale or
-    # incomplete indexed text cannot prevent query-adaptive extraction.
-    if cached_chunks and not retrieval_file_ids:
+    if cached_chunks:
         cached_file_names: List[str] = []
         for chunk in cached_chunks:
             file_name = chunk.get("file_name")
@@ -917,103 +1137,123 @@ async def _ask_question_uncached(
             [],
             cached_chunks,
         )
+        ans_lower = answer.lower()
         is_out_of_scope = (
-            "do not contain information regarding" in answer
-            or "does not contain information regarding" in answer
-            or "doesn't contain information regarding" in answer
+            "do not contain information regarding" in ans_lower
+            or "does not contain information regarding" in ans_lower
+            or "doesn't contain information regarding" in ans_lower
+            or "not shown in the supplied text" in ans_lower
+            or "not found in the supplied text" in ans_lower
+            or "could not be read from the selected document" in ans_lower
         )
-        if is_out_of_scope:
-            if not retrieval_file_ids:
-                fallback_answer = (
-                    "The information you're asking about isn't in your Google Drive documents. "
-                    "Would you like me to answer using general knowledge instead?"
-                )
-                await _save_answer(
-                    db=db,
-                    user_id=user_id,
-                    query=query,
-                    answer=fallback_answer,
-                    intent=str(intent),
-                    answer_kind="insufficient",
-                    selected_file_ids=selected_file_ids,
-                    identified_files=[],
-                    source_file_ids=[],
-                    source_file_names=[],
-                    document_versions={},
-                    sources=[],
-                )
-                return _answer_response(
-                    query,
-                    intent,
-                    fallback_answer,
-                    analysis_required=False,
-                    needs_general_confirmation=True,
-                    answer_source="insufficient_drive_evidence",
-                    matched_file_ids=[],
-                    candidate_files=[],
-                    safe_embedded_files=[],
-                    retrieved_sources=[],
-                    auto_discovered=True,
-                )
-            else:
-                selected_str = ", ".join(cached_names) if cached_names else "selected document(s)"
-                fallback_answer = (
-                    f"The selected document(s) ({selected_str}) do not contain information regarding '{query}'. "
-                    f"Would you like me to answer using general knowledge instead?"
-                )
-                await _save_answer(
-                    db=db,
-                    user_id=user_id,
-                    query=query,
-                    answer=fallback_answer,
-                    intent=str(intent),
-                    answer_kind="insufficient",
-                    selected_file_ids=selected_file_ids,
-                    identified_files=cached_names,
-                    source_file_ids=source_file_ids,
-                    source_file_names=source_names or cached_names,
-                    document_versions=versions,
-                    sources=[],
-                )
-                return _answer_response(
-                    query,
-                    intent,
-                    fallback_answer,
-                    analysis_required=False,
-                    needs_general_confirmation=True,
-                    answer_source="insufficient_drive_evidence",
-                    matched_file_ids=matched_file_ids,
-                    candidate_files=cached_names,
-                    safe_embedded_files=cached_names,
-                    retrieved_sources=[],
-                    auto_discovered=False,
-                )
+        if not is_out_of_scope:
+            await _save_answer(
+                db=db,
+                user_id=user_id,
+                query=query,
+                answer=answer,
+                intent=str(intent),
+                answer_kind="document",
+                selected_file_ids=selected_file_ids,
+                identified_files=cached_names,
+                source_file_ids=source_file_ids,
+                source_file_names=source_names or cached_names,
+                document_versions=versions,
+                sources=sources,
+            )
+            return _answer_response(
+                query,
+                intent,
+                answer,
+                analysis_required=True,
+                candidate_files=cached_names,
+                safe_embedded_files=cached_names,
+                retrieved_sources=sources,
+                auto_discovered=not retrieval_file_ids,
+                answer_source="google_drive",
+                matched_file_ids=matched_file_ids,
+            )
+        elif selected_file_ids:
+            selected_str = ", ".join(cached_names) if cached_names else "selected document(s)"
+            fallback_answer = (
+                f"The selected document(s) ({selected_str}) do not contain information regarding '{query}'. "
+                f"Would you like me to answer using general knowledge instead?"
+            )
+            await _save_answer(
+                db=db,
+                user_id=user_id,
+                query=query,
+                answer=fallback_answer,
+                intent=str(intent),
+                answer_kind="insufficient",
+                selected_file_ids=selected_file_ids,
+                identified_files=cached_names,
+                source_file_ids=source_file_ids,
+                source_file_names=source_names or cached_names,
+                document_versions=versions,
+                sources=sources,
+            )
+            return _answer_response(
+                query,
+                intent,
+                fallback_answer,
+                analysis_required=False,
+                needs_general_confirmation=True,
+                answer_source="insufficient_drive_evidence",
+                matched_file_ids=matched_file_ids,
+                candidate_files=cached_names,
+                safe_embedded_files=cached_names,
+                retrieved_sources=[],
+                auto_discovered=False,
+            )
+        elif not retrieval_file_ids:
+            fallback_answer = (
+                "The information you're asking about isn't in your Google Drive documents. "
+                "Would you like me to answer using general knowledge instead?"
+            )
+            await _save_answer(
+                db=db,
+                user_id=user_id,
+                query=query,
+                answer=fallback_answer,
+                intent=str(intent),
+                answer_kind="insufficient",
+                selected_file_ids=selected_file_ids,
+                identified_files=[],
+                source_file_ids=[],
+                source_file_names=[],
+                document_versions={},
+                sources=[],
+            )
+            return _answer_response(
+                query,
+                intent,
+                fallback_answer,
+                analysis_required=False,
+                needs_general_confirmation=True,
+                answer_source="insufficient_drive_evidence",
+                matched_file_ids=[],
+                candidate_files=[],
+                safe_embedded_files=[],
+                retrieved_sources=[],
+                auto_discovered=True,
+            )
 
+    if intent == "direct_answer":
+        try:
+            answer = await answer_general_query(query)
+        except GeminiServiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
         await _save_answer(
-            db=db,
-            user_id=user_id,
-            query=query,
-            answer=answer,
-            intent=str(intent),
-            answer_kind="document",
+            db, user_id, query, answer, intent, "general",
             selected_file_ids=selected_file_ids,
-            identified_files=cached_names,
-            source_file_ids=source_file_ids,
-            source_file_names=source_names or cached_names,
-            document_versions=versions,
-            sources=sources,
         )
         return _answer_response(
             query,
             intent,
             answer,
-            analysis_required=True,
-            candidate_files=cached_names,
-            safe_embedded_files=cached_names,
-            retrieved_sources=sources,
-            auto_discovered=not retrieval_file_ids,
-            answer_source="google_drive",
-            matched_file_ids=matched_file_ids,
+            analysis_required=False,
+            answer_source="general_knowledge",
         )
 
     # Validate user & drive connection
@@ -1095,103 +1335,9 @@ async def _ask_question_uncached(
         "_live_tracker": live_tracker,
     }
 
-    # Leave time for route setup and response persistence inside the 30s request budget.
     workflow_started_at = time.perf_counter()
     try:
-        final_state = await asyncio.wait_for(
-            rag_graph.ainvoke(initial_state),
-            timeout=24.0,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("[RAG] Workflow reached 24s budget; using available document evidence only")
-        curr_chunks = live_tracker.get("retrieved_chunks", [])
-        safe_files = live_tracker.get("safe_files", [])
-        cands = live_tracker.get("candidate_files", [])
-        cand_names = [f.get("name") for f in safe_files if f.get("name")] or [f.get("name") for f in cands if f.get("name")]
-
-        if not curr_chunks and safe_files:
-            curr_chunks = [
-                {
-                    "chunk_text": file_info["extracted_text"],
-                    "file_name": file_info.get("name", "Document"),
-                    "file_id": file_info.get("file_id"),
-                    "source_modified_time": file_info.get("source_modified_time"),
-                    "extraction_version": file_info.get("extraction_version"),
-                    "similarity": 1.0,
-                }
-                for file_info in safe_files
-                if file_info.get("extracted_text")
-            ]
-            if not curr_chunks:
-                try:
-                    full_texts = await _get_full_document_texts(
-                        db,
-                        [file_info["db_id"] for file_info in safe_files if file_info.get("db_id")],
-                    )
-                    curr_chunks = [
-                        {
-                            "chunk_text": text,
-                            "file_name": file_name,
-                            "similarity": 1.0,
-                        }
-                        for file_name, text in full_texts.items()
-                    ]
-                except Exception:
-                    logger.exception(
-                        "[RAG] Could not load indexed text after workflow timeout."
-                    )
-
-        timeout_grounded = False
-        if curr_chunks:
-            try:
-                timeout_ans = await synthesize_answer(
-                    query,
-                    curr_chunks,
-                    [],
-                    selected_file_names=cand_names,
-                    auto_discovered=len(retrieval_file_ids) == 0,
-                    intent=intent,
-                )
-                timeout_grounded = bool(timeout_ans)
-            except Exception as exc:
-                logger.warning(
-                    "[RAG] Evidence-only timeout synthesis failed: %s",
-                    exc,
-                )
-                timeout_ans = ""
-        else:
-            timeout_ans = ""
-
-        if not timeout_ans:
-            target = ", ".join(cand_names) if cand_names else "the selected document"
-            timeout_ans = (
-                f"I couldn't finish extracting searchable text from {target} within the time limit. "
-                "I haven't substituted general knowledge or guessed the candidate list. Please retry; "
-                "if this continues, check the backend logs for PDF OCR errors."
-            )
-
-        if not timeout_grounded:
-            return _answer_response(
-                query,
-                intent,
-                timeout_ans,
-                analysis_required=False,
-                candidate_files=cand_names,
-                safe_embedded_files=cand_names,
-                answer_source="insufficient_drive_evidence",
-                matched_file_ids=matched_file_ids,
-                auto_discovered=not retrieval_file_ids,
-            )
-
-        final_state = {
-            "answer": timeout_ans,
-            "retrieved_chunks": curr_chunks,
-            "safe_files": safe_files,
-            "candidate_files": cands,
-            "confidential_files": live_tracker.get("confidential_files", []),
-            "needs_general_confirmation": False,
-            "auto_discovered": len(retrieval_file_ids) == 0,
-        }
+        final_state = await rag_graph.ainvoke(initial_state)
     except GeminiServiceUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
@@ -1213,6 +1359,91 @@ async def _ask_question_uncached(
         safe_files = final_state.get("sheet_scoped_safe_files", [])
 
     if final_state.get("needs_general_confirmation"):
+        if matched_file_ids and not selected_file_ids:
+            logger.info(
+                "[RAG] Name-matched file(s) did not answer the query; "
+                "trying semantic search across indexed Drive documents."
+            )
+            try:
+                fallback_chunks = await search_cached_user_documents(
+                    db,
+                    user_id,
+                    query,
+                    query_embedding_cache=query_embedding_cache,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[RAG] Semantic fallback search failed after a Drive-name match."
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to search the indexed documents for a semantic fallback.",
+                ) from exc
+
+            if fallback_chunks:
+                fallback_names = list(dict.fromkeys(
+                    chunk["file_name"]
+                    for chunk in fallback_chunks
+                    if chunk.get("file_name")
+                ))
+                try:
+                    fallback_answer = await synthesize_answer(
+                        query,
+                        fallback_chunks,
+                        [],
+                        selected_file_names=fallback_names,
+                        auto_discovered=True,
+                        available_file_names=fallback_names,
+                        intent=intent,
+                    )
+                except GeminiServiceUnavailableError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=str(exc),
+                    ) from exc
+                fb_lower = fallback_answer.lower()
+                fallback_out_of_scope = (
+                    "do not contain information regarding" in fb_lower
+                    or "does not contain information regarding" in fb_lower
+                    or "doesn't contain information regarding" in fb_lower
+                    or "not shown in the supplied text" in fb_lower
+                    or "not found in the supplied text" in fb_lower
+                    or "could not be read from the selected document" in fb_lower
+                )
+                if not fallback_out_of_scope:
+                    (
+                        fallback_source_ids,
+                        fallback_source_names,
+                        fallback_versions,
+                        fallback_sources,
+                    ) = _cache_document_evidence([], fallback_chunks)
+                    await _save_answer(
+                        db=db,
+                        user_id=user_id,
+                        query=query,
+                        answer=fallback_answer,
+                        intent=str(intent),
+                        answer_kind="document",
+                        selected_file_ids=selected_file_ids,
+                        identified_files=fallback_names,
+                        source_file_ids=fallback_source_ids,
+                        source_file_names=fallback_source_names or fallback_names,
+                        document_versions=fallback_versions,
+                        sources=fallback_sources,
+                    )
+                    return _answer_response(
+                        query,
+                        intent,
+                        fallback_answer,
+                        analysis_required=True,
+                        candidate_files=fallback_names,
+                        safe_embedded_files=fallback_names,
+                        retrieved_sources=fallback_sources,
+                        auto_discovered=True,
+                        answer_source="google_drive",
+                        matched_file_ids=matched_file_ids,
+                    )
+
         retrieved_chunks = final_state.get("retrieved_chunks", [])
         source_file_ids, source_names, versions, sources = _cache_document_evidence(
             safe_files,
@@ -1254,16 +1485,23 @@ async def _ask_question_uncached(
         retrieved_chunks,
     )
     answer = final_state.get("answer") or ""
-    await store_cached_answer(
-        db,
-        user_id,
-        query,
-        intent,
-        answer,
-        "document",
+    candidate_names = (
+        [file_info.get("name") for file_info in safe_files]
+        if sheet_scope
+        else [f.get("name") for f in final_state.get("candidate_files", [])]
+    )
+    all_source_names = list(dict.fromkeys(source_names + [n for n in candidate_names if n]))
+    await _save_answer(
+        db=db,
+        user_id=user_id,
+        query=query,
+        answer=answer,
+        intent=str(intent),
+        answer_kind="document",
         selected_file_ids=selected_file_ids,
+        identified_files=all_source_names,
         source_file_ids=source_file_ids,
-        source_file_names=source_names,
+        source_file_names=all_source_names,
         document_versions=versions,
         sources=sources,
     )
@@ -1355,3 +1593,169 @@ async def get_query_history(user_id: str, db: AsyncSession = Depends(get_db)):
             for r in records
         ]
     }
+
+
+
+@router.get("/sessions")
+async def list_chat_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
+    """List all active (non-deleted) chat sessions for a user."""
+    stmt = (
+        select(ChatSession)
+        .where(ChatSession.user_id == user_id, ChatSession.is_deleted.is_(False))
+        .order_by(ChatSession.updated_at.desc())
+    )
+    res = await db.execute(stmt)
+    sessions = res.scalars().all()
+    return {
+        "sessions": [
+            {
+                "id": str(s.id),
+                "title": s.title,
+                "message_count": len(s.messages or []),
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            for s in sessions
+        ]
+    }
+
+
+@router.post("/sessions")
+async def create_chat_session(payload: CreateSessionRequest, db: AsyncSession = Depends(get_db)):
+    """Create a new chat session for a user."""
+    default_welcome = [
+        {
+            "id": "welcome-1",
+            "sender": "ai",
+            "text": "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
+            "time": "Just now",
+            "showSecurityNotice": True,
+            "citations": [],
+            "blockedFiles": [],
+        }
+    ]
+    msgs = payload.messages if payload.messages is not None else default_welcome
+    session = ChatSession(
+        user_id=payload.user_id,
+        title=payload.title or "New Chat",
+        messages=msgs,
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "id": str(session.id),
+        "title": session.title,
+        "messages": session.messages or [],
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+    }
+
+
+@router.get("/sessions/{session_id}")
+async def get_chat_session(
+    session_id: str,
+    user_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a chat session and its full message history."""
+    stmt = select(ChatSession).where(
+        ChatSession.id == session_id,
+        ChatSession.is_deleted.is_(False),
+    )
+    if user_id:
+        stmt = stmt.where(ChatSession.user_id == user_id)
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return {
+        "id": str(session.id),
+        "title": session.title,
+        "messages": session.messages or [],
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+    }
+
+
+@router.put("/sessions/{session_id}")
+async def update_chat_session(session_id: str, payload: UpdateSessionRequest, db: AsyncSession = Depends(get_db)):
+    """Update title and/or messages of a chat session."""
+    stmt = select(ChatSession).where(
+        ChatSession.id == session_id,
+        ChatSession.user_id == payload.user_id,
+        ChatSession.is_deleted.is_(False),
+    )
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    if payload.title is not None:
+        session.title = payload.title.strip()[:255] or session.title
+    if payload.messages is not None:
+        session.messages = payload.messages
+    session.updated_at = datetime.utcnow()
+    await db.commit()
+    return {
+        "id": str(session.id),
+        "title": session.title,
+        "message_count": len(session.messages or []),
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+    }
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    user_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a chat session as deleted."""
+    stmt = select(ChatSession).where(ChatSession.id == session_id)
+    if user_id:
+        stmt = stmt.where(ChatSession.user_id == user_id)
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    session.is_deleted = True
+    session.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"deleted": True, "id": str(session.id)}
+
+
+@router.post("/sessions/{session_id}/clear")
+async def clear_chat_session(
+    session_id: str,
+    user_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear all messages in the chat session, resetting to the initial state."""
+    stmt = select(ChatSession).where(
+        ChatSession.id == session_id,
+        ChatSession.is_deleted.is_(False),
+    )
+    if user_id:
+        stmt = stmt.where(ChatSession.user_id == user_id)
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    default_welcome = [
+        {
+            "id": "welcome-1",
+            "sender": "ai",
+            "text": "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
+            "time": "Just now",
+            "showSecurityNotice": True,
+            "citations": [],
+            "blockedFiles": [],
+        }
+    ]
+    session.messages = default_welcome
+    session.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"cleared": True, "id": str(session.id), "messages": session.messages}

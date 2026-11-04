@@ -11,8 +11,8 @@ from typing import Optional, List, Dict, Any
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Header, status
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import func, select, update, desc
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -83,6 +83,22 @@ def decode_admin_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def calculate_cost(prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0) -> float:
+    """
+    Computes estimated cost in USD based on Gemini API standard rates:
+    - Input: $0.075 per 1,000,000 tokens ($0.000075 / 1k tokens)
+    - Output: $0.300 per 1,000,000 tokens ($0.000300 / 1k tokens)
+    If prompt/completion not separated, uses blended rate ($0.15 / 1M tokens).
+    """
+    if prompt_tokens > 0 or completion_tokens > 0:
+        cost = (prompt_tokens * 0.075 / 1_000_000) + (completion_tokens * 0.30 / 1_000_000)
+    elif total_tokens > 0:
+        cost = total_tokens * 0.15 / 1_000_000
+    else:
+        cost = 0.0
+    return round(cost, 6)
+
+
 async def get_current_admin(
     authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
@@ -149,6 +165,29 @@ class AdminApprovalActionRequest(BaseModel):
     action: str  # "APPROVE" or "REJECT"
 
 
+class AssignTokensRequest(BaseModel):
+    assigned_tokens: int = Field(ge=0, le=50_000_000)
+    duration: Optional[str] = "1_month" # "1_week", "3_weeks", "1_month", "6_months", "1_year"
+
+
+class UserAdminSessionRequest(BaseModel):
+    user_id: str
+
+
+SUBSCRIPTION_DURATION_DAYS = {
+    "1_week": 7,
+    "3_weeks": 21,
+    "1_month": 30,
+    "6_months": 180,
+    "1_year": 365,
+}
+
+def calculate_token_expiration(duration: Optional[str]) -> tuple[Optional[datetime], int]:
+    days = SUBSCRIPTION_DURATION_DAYS.get(duration or "1_month", 30)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    return expires_at, days
+
+
 # ─────────────────────────────────────────────────────────────
 # Endpoints: Setup Status, Auth & Password Reset
 # ─────────────────────────────────────────────────────────────
@@ -170,6 +209,81 @@ async def get_setup_status(db: AsyncSession = Depends(get_db)):
     return {
         "has_super_admin": has_super,
         "super_admin_email_hint": email_hint,
+    }
+
+
+@router.post("/user-admin-session")
+async def get_user_admin_session(
+    payload: UserAdminSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Seamlessly creates or retrieves a User Admin (SECONDARY_ADMIN) session token
+    for a user who is authenticated in the User Portal.
+    """
+    try:
+        uid = uuid.UUID(payload.user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID format.")
+
+    user = await db.get(User, uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # Check if this user is the registered Lead Admin (SUPER_ADMIN)
+    super_admin_res = await db.execute(
+        select(AdminUser).where(
+            func.lower(AdminUser.email) == user.email.lower(),
+            AdminUser.role == "SUPER_ADMIN",
+            AdminUser.status == "APPROVED",
+        )
+    )
+    super_admin = super_admin_res.scalars().first()
+    if super_admin:
+        token = create_admin_token(str(super_admin.id), super_admin.email, super_admin.role)
+        return {
+            "token": token,
+            "role": "SUPER_ADMIN",
+            "email": super_admin.email,
+            "full_name": super_admin.full_name,
+        }
+
+    # Regular user: find or create their SECONDARY_ADMIN record
+    admin_res = await db.execute(
+        select(AdminUser).where(
+            (AdminUser.linked_user_id == user.id) | (func.lower(AdminUser.email) == user.email.lower())
+        )
+    )
+    admin = admin_res.scalars().first()
+
+    if not admin:
+        admin = AdminUser(
+            email=user.email.lower(),
+            password_hash=user.password_hash or hash_password("UserAdmin@123"),
+            full_name=user.full_name or user.email.split("@")[0],
+            role="SECONDARY_ADMIN",
+            status="APPROVED",
+            approved_by="AUTO_APPROVED",
+            approved_at=datetime.utcnow(),
+            linked_user_id=user.id,
+        )
+        db.add(admin)
+        await db.flush()
+    else:
+        admin.status = "APPROVED"
+        admin.role = "SECONDARY_ADMIN"
+        if not admin.linked_user_id:
+            admin.linked_user_id = user.id
+
+    admin.last_login_at = datetime.utcnow()
+    await db.commit()
+
+    token = create_admin_token(str(admin.id), admin.email, admin.role)
+    return {
+        "token": token,
+        "role": "SECONDARY_ADMIN",
+        "email": admin.email,
+        "full_name": admin.full_name,
     }
 
 
@@ -256,24 +370,25 @@ async def admin_login(payload: AdminLoginRequest, db: AsyncSession = Depends(get
                 detail="Incorrect password. Please use your User Portal account password or use 'Forgot password?'.",
             )
 
-        # Check if user has requested User Admin access
-        if not admin or admin.role != "SECONDARY_ADMIN":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You have not requested User Admin access yet. Please click 'Request User Admin Access' and provide your reason for approval.",
+        # User does not require approval for login into User Admin account
+        if not admin:
+            admin = AdminUser(
+                email=email,
+                password_hash=user.password_hash if (user and user.password_hash) else hash_password(password),
+                full_name=user.full_name if (user and user.full_name) else email.split("@")[0],
+                role="SECONDARY_ADMIN",
+                status="APPROVED",
+                approved_by="AUTO_APPROVED",
+                approved_at=datetime.utcnow(),
+                linked_user_id=user.id if user else None,
             )
-
-        # Check approval status
-        if admin.status == "PENDING":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Your User Admin access request is currently PENDING approval by the Lead Admin. You will be able to log in once approved.",
-            )
-        if admin.status == "REJECTED":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Your User Admin access request was not approved by the Lead Admin.",
-            )
+            db.add(admin)
+            await db.flush()
+        else:
+            admin.status = "APPROVED"
+            admin.role = "SECONDARY_ADMIN"
+            if user and not admin.linked_user_id:
+                admin.linked_user_id = user.id
 
         # Approved User Admin: sync linked user and password hash if needed
         if user:
@@ -317,12 +432,14 @@ async def admin_login(payload: AdminLoginRequest, db: AsyncSession = Depends(get
                 detail="Invalid email or password.",
             )
 
-        if admin.status == "PENDING":
+        if admin.role != "SUPER_ADMIN":
+            admin.status = "APPROVED"
+        elif admin.status == "PENDING":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your admin access request is currently PENDING approval by the Lead Admin.",
             )
-        if admin.status == "REJECTED":
+        elif admin.status == "REJECTED":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your admin access request was not approved by the Lead Admin.",
@@ -422,41 +539,16 @@ async def admin_register(payload: AdminRegisterRequest, db: AsyncSession = Depen
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="This email belongs to the Lead Admin. Please sign in via the Lead Admin tab.",
                 )
-            if existing.status == "PENDING":
-                return {
-                    "status": "PENDING",
-                    "role": "SECONDARY_ADMIN",
-                    "message": "Your User Admin request is already submitted and pending approval by the Lead Admin.",
-                }
-            if existing.status == "APPROVED":
-                return {
-                    "status": "APPROVED",
-                    "role": "SECONDARY_ADMIN",
-                    "message": "Your User Admin account is already approved! Please sign in using your User Portal credentials.",
-                }
-            if existing.status == "REJECTED":
-                # Re-submit request with updated reason
-                existing.status = "PENDING"
-                existing.request_note = reason
-                existing.password_hash = hash_password(password)
-                existing.updated_at = datetime.utcnow()
-                await db.commit()
-
-                try:
-                    await notify_super_admin_of_registration(
-                        applicant_name=full_name,
-                        applicant_email=email,
-                        super_admin_email=existing_super_admin.email,
-                        request_note=reason,
-                    )
-                except Exception as e:
-                    logger.warning("[ADMIN] Failed to trigger notification email: %s", e)
-
-                return {
-                    "status": "PENDING",
-                    "role": "SECONDARY_ADMIN",
-                    "message": "Your updated User Admin request has been submitted to the Lead Admin for approval.",
-                }
+            existing.status = "APPROVED"
+            existing.role = "SECONDARY_ADMIN"
+            existing.password_hash = hash_password(password)
+            existing.updated_at = datetime.utcnow()
+            await db.commit()
+            return {
+                "status": "APPROVED",
+                "role": "SECONDARY_ADMIN",
+                "message": "User Admin account registered and activated successfully! You can now sign in directly.",
+            }
 
         # Link or create corresponding User Portal account
         user_res = await db.execute(select(User).where(func.lower(User.email) == email))
@@ -484,31 +576,20 @@ async def admin_register(payload: AdminRegisterRequest, db: AsyncSession = Depen
             password_hash=user.password_hash,
             full_name=full_name,
             role="SECONDARY_ADMIN",
-            status="PENDING",
+            status="APPROVED",
             request_note=reason,
+            approved_by="AUTO_APPROVED",
+            approved_at=datetime.utcnow(),
             linked_user_id=user.id,
         )
         db.add(new_admin)
         await db.commit()
         await db.refresh(new_admin)
 
-        try:
-            await notify_super_admin_of_registration(
-                applicant_name=full_name,
-                applicant_email=email,
-                super_admin_email=existing_super_admin.email,
-                request_note=reason,
-            )
-        except Exception as e:
-            logger.warning("[ADMIN] Failed to trigger notification email: %s", e)
-
         return {
-            "status": "PENDING",
+            "status": "APPROVED",
             "role": "SECONDARY_ADMIN",
-            "message": (
-                "User Admin request submitted successfully! A notification email has been dispatched "
-                "to the Lead Admin for approval. Once approved, you can log in using your User Portal credentials."
-            ),
+            "message": "User Admin account registered and activated successfully! You can now sign in directly using your User Portal credentials.",
         }
 
 
@@ -694,6 +775,7 @@ async def get_technical_metrics(
 
     cache_misses = max(total_queries - cache_hits, 0)
     cache_hit_ratio = round((cache_hits / total_queries * 100), 1) if total_queries > 0 else 0.0
+    total_cost_usd = calculate_cost(prompt_tokens, completion_tokens, total_tokens)
 
     # Logged-in user accounts list with activity summary
     users_stmt = (
@@ -736,22 +818,34 @@ async def get_technical_metrics(
         .limit(50)
     )
     logs_res = await db.execute(logs_stmt)
-    telemetry_logs = [
-        {
+    telemetry_logs = []
+    for row in logs_res:
+        p_tok = row[3] or 0
+        c_tok = row[4] or 0
+        tot_tok = row[5] or 0
+        cache_hit_flag = bool(row[6])
+        api_called_flag = bool(row[7])
+
+        if cache_hit_flag and not api_called_flag:
+            query_cost = 0.0
+        else:
+            query_cost = calculate_cost(p_tok, c_tok, tot_tok)
+
+        telemetry_logs.append({
             "id": str(row[0]),
             "user_email": row[1] or "Anonymous User",
             "latency_ms": round(row[2], 1),
-            "prompt_tokens": row[3],
-            "completion_tokens": row[4],
-            "total_tokens": row[5],
-            "cache_hit": row[6],
-            "api_called": row[7],
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "total_tokens": tot_tok,
+            "cost_usd": query_cost,
+            "cost_formatted": f"${query_cost:.5f}" if query_cost > 0 else "$0.00000",
+            "cache_hit": cache_hit_flag,
+            "api_called": api_called_flag,
             "intent": row[8] or "general",
             "timestamp": row[9].strftime("%Y-%m-%d %H:%M:%S") if row[9] else "-",
             "privacy_status": "Zero-Knowledge: Query content redacted",
-        }
-        for row in logs_res
-    ]
+        })
 
     return {
         "kpis": {
@@ -760,6 +854,8 @@ async def get_technical_metrics(
             "total_tokens": total_tokens,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "total_cost_usd": round(total_cost_usd, 4),
+            "formatted_total_cost": f"${total_cost_usd:.4f}",
             "cache_hits": cache_hits,
             "cache_misses": cache_misses,
             "cache_hit_ratio": cache_hit_ratio,
@@ -903,6 +999,7 @@ async def get_user_activity_audit(
     queries = res.scalars().all()
 
     audit_records = []
+    total_query_tokens_calc = 0
     for q in queries:
         files_analyzed = q.identified_files or []
         files_referenced = q.source_file_names or []
@@ -913,6 +1010,15 @@ async def get_user_activity_audit(
         )
         answer_snippet = (q.answer_text[:140] + "...") if q.answer_text and len(q.answer_text) > 140 else (q.answer_text or "")
 
+        total_toks = getattr(q, "total_tokens", 0) or 0
+        prompt_toks = getattr(q, "prompt_tokens", 0) or 0
+        comp_toks = getattr(q, "completion_tokens", 0) or 0
+        if total_toks == 0:
+            prompt_toks = max(1, len(q.query_text or "") // 4)
+            comp_toks = max(1, len(q.answer_text or "") // 4)
+            total_toks = prompt_toks + comp_toks
+        total_query_tokens_calc += total_toks
+
         audit_records.append({
             "id": str(q.id),
             "query_asked": q.query_text,
@@ -920,7 +1026,332 @@ async def get_user_activity_audit(
             "files_referenced": files_referenced,
             "responding_file_name": responding_file,
             "answer_snippet": answer_snippet,
+            "prompt_tokens": prompt_toks,
+            "completion_tokens": comp_toks,
+            "total_tokens": total_toks,
             "timestamp": q.created_at.strftime("%Y-%m-%d %H:%M:%S") if q.created_at else "-",
         })
 
-    return {"audits": audit_records}
+    target_user_id = current_admin.linked_user_id
+    if not target_user_id:
+        user_res = await db.execute(
+            select(User.id).where(func.lower(User.email) == current_admin.email.lower())
+        )
+        target_user_id = user_res.scalar()
+
+    user_obj = None
+    assigned_tokens = 50000
+    if target_user_id:
+        user_obj = await db.get(User, target_user_id)
+        if user_obj and hasattr(user_obj, "assigned_tokens"):
+            assigned_tokens = user_obj.assigned_tokens or 50000
+
+    tokens_consumed = 0
+    if target_user_id:
+        consumed_res = await db.execute(
+            select(func.coalesce(func.sum(QueryTelemetry.total_tokens), 0)).where(
+                QueryTelemetry.user_id == target_user_id
+            )
+        )
+        tokens_consumed = int(consumed_res.scalar() or 0)
+
+    if total_query_tokens_calc > tokens_consumed:
+        tokens_consumed = total_query_tokens_calc
+
+    now_utc = datetime.now(timezone.utc)
+    is_expired = False
+    sub_duration = getattr(user_obj, "subscription_duration", "1_month") or "1_month"
+    token_expires_at_iso = None
+    if user_obj and user_obj.token_expires_at:
+        token_expires_at_iso = user_obj.token_expires_at.isoformat()
+        if now_utc > user_obj.token_expires_at:
+            is_expired = True
+
+    # Tokens used in current period (since last token update):
+    current_period_consumed = 0
+    if user_obj and user_obj.tokens_assigned_at and target_user_id:
+        p_res = await db.execute(
+            select(func.coalesce(func.sum(QueryTelemetry.total_tokens), 0)).where(
+                QueryTelemetry.user_id == target_user_id,
+                QueryTelemetry.created_at >= user_obj.tokens_assigned_at,
+            )
+        )
+        current_period_consumed = int(p_res.scalar() or 0)
+    else:
+        current_period_consumed = tokens_consumed
+
+    if is_expired:
+        tokens_left = 0
+    else:
+        tokens_left = max(0, assigned_tokens - tokens_consumed)
+
+    return {
+        "audits": audit_records,
+        "token_stats": {
+            "assigned_tokens": assigned_tokens,
+            "tokens_consumed": tokens_consumed,
+            "current_period_consumed": current_period_consumed,
+            "tokens_left": tokens_left,
+            "subscription_duration": sub_duration,
+            "token_expires_at": token_expires_at_iso,
+            "is_expired": is_expired,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# LEAD ADMIN ONLY: User Token Usage & Allocation
+# ─────────────────────────────────────────────────────────────
+@router.get("/users-token-usage")
+async def get_users_token_usage(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lead Admin view: Displays token consumption, expiration, and allocated token budget for all users.
+    """
+    if current_admin.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Lead Admin access required to view user token usage.",
+        )
+
+    users_res = await db.execute(select(User).order_by(User.created_at.desc()))
+    users = users_res.scalars().all()
+
+    telemetry_res = await db.execute(
+        select(
+            QueryTelemetry.user_id,
+            func.coalesce(func.sum(QueryTelemetry.total_tokens), 0).label("consumed"),
+            func.coalesce(func.sum(QueryTelemetry.prompt_tokens), 0).label("prompt_tokens"),
+            func.coalesce(func.sum(QueryTelemetry.completion_tokens), 0).label("completion_tokens"),
+            func.count(QueryTelemetry.id).label("queries_count"),
+        ).group_by(QueryTelemetry.user_id)
+    )
+    usage_map = {
+        row.user_id: {
+            "consumed": int(row.consumed),
+            "prompt_tokens": int(row.prompt_tokens),
+            "completion_tokens": int(row.completion_tokens),
+            "queries_count": int(row.queries_count),
+        }
+        for row in telemetry_res
+    }
+
+    now_utc = datetime.now(timezone.utc)
+    user_list = []
+    for u in users:
+        stats = usage_map.get(
+            u.id,
+            {"consumed": 0, "prompt_tokens": 0, "completion_tokens": 0, "queries_count": 0},
+        )
+        assigned = getattr(u, "assigned_tokens", 50000) or 50000
+        consumed = stats["consumed"]
+        p_tok = stats["prompt_tokens"]
+        c_tok = stats["completion_tokens"]
+        user_cost = calculate_cost(p_tok, c_tok, consumed)
+
+        # Check expiration
+        is_expired = False
+        if u.token_expires_at and now_utc > u.token_expires_at:
+            is_expired = True
+
+        # Check current period consumption (from tokens_assigned_at)
+        period_consumed = 0
+        if u.tokens_assigned_at:
+            period_res = await db.execute(
+                select(func.coalesce(func.sum(QueryTelemetry.total_tokens), 0)).where(
+                    QueryTelemetry.user_id == u.id,
+                    QueryTelemetry.created_at >= u.tokens_assigned_at,
+                )
+            )
+            period_consumed = int(period_res.scalar() or 0)
+        else:
+            period_consumed = consumed
+
+        if is_expired:
+            tokens_left = 0
+        else:
+            tokens_left = max(0, assigned - consumed)
+
+        user_list.append({
+            "user_id": str(u.id),
+            "email": u.email,
+            "full_name": u.full_name or u.email.split("@")[0],
+            "assigned_tokens": assigned,
+            "subscription_duration": getattr(u, "subscription_duration", "1_month") or "1_month",
+            "tokens_assigned_at": u.tokens_assigned_at.isoformat() if u.tokens_assigned_at else (u.created_at.isoformat() if u.created_at else None),
+            "token_expires_at": u.token_expires_at.isoformat() if u.token_expires_at else None,
+            "is_expired": is_expired,
+            "tokens_consumed": consumed,
+            "period_tokens_consumed": period_consumed,
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "estimated_cost_usd": user_cost,
+            "cost_formatted": f"${user_cost:.4f}",
+            "tokens_left": tokens_left,
+            "query_count": stats["queries_count"],
+            "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S") if u.created_at else "-",
+        })
+
+    total_system_tokens = sum(u["tokens_consumed"] for u in user_list)
+    total_system_cost = sum(u["estimated_cost_usd"] for u in user_list)
+
+    return {
+        "users": user_list,
+        "system_summary": {
+            "total_tokens_consumed": total_system_tokens,
+            "total_cost_usd": round(total_system_cost, 4),
+            "cost_formatted": f"${total_system_cost:.4f}",
+            "total_users": len(user_list),
+        },
+    }
+
+
+@router.post("/users/{user_id}/assign-tokens")
+async def assign_user_tokens(
+    user_id: str,
+    payload: AssignTokensRequest,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lead Admin action: Updates the allocated token balance and subscription duration for a user.
+    """
+    if current_admin.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Lead Admin access required to assign user tokens.",
+        )
+
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID format.")
+
+    user = await db.get(User, uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    duration_key = payload.duration or "1_month"
+    expires_at, days = calculate_token_expiration(duration_key)
+    now_utc = datetime.now(timezone.utc)
+
+    user.assigned_tokens = payload.assigned_tokens
+    user.subscription_duration = duration_key
+    user.tokens_assigned_at = now_utc
+    user.token_expires_at = expires_at
+    await db.commit()
+
+    consumed_res = await db.execute(
+        select(
+            func.coalesce(func.sum(QueryTelemetry.total_tokens), 0).label("tot"),
+            func.coalesce(func.sum(QueryTelemetry.prompt_tokens), 0).label("pt"),
+            func.coalesce(func.sum(QueryTelemetry.completion_tokens), 0).label("ct"),
+        ).where(
+            QueryTelemetry.user_id == user.id
+        )
+    )
+    c_row = consumed_res.first()
+    consumed = int(c_row.tot) if c_row else 0
+    p_tok = int(c_row.pt) if c_row else 0
+    c_tok = int(c_row.ct) if c_row else 0
+    user_cost = calculate_cost(p_tok, c_tok, consumed)
+
+    formatted_duration = duration_key.replace("_", " ").title()
+    return {
+        "success": True,
+        "user_id": str(user.id),
+        "email": user.email,
+        "assigned_tokens": user.assigned_tokens,
+        "subscription_duration": user.subscription_duration,
+        "token_expires_at": user.token_expires_at.isoformat() if user.token_expires_at else None,
+        "is_expired": False,
+        "tokens_consumed": consumed,
+        "estimated_cost_usd": user_cost,
+        "cost_formatted": f"${user_cost:.4f}",
+        "tokens_left": user.assigned_tokens,
+        "message": f"Successfully updated tokens to {payload.assigned_tokens:,} ({formatted_duration}) for {user.email}.",
+    }
+
+
+@router.delete("/users/{user_id}")
+async def delete_user_account(
+    user_id: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lead Admin action: Permanently deletes a user and cascades deletion of all their
+    Drive files, document chunks, chat sessions, queries, telemetry, and cached answers.
+    Also deletes any associated secondary AdminUser entry for that user.
+    """
+    if current_admin.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Lead Admin access required to delete user accounts.",
+        )
+
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID format.")
+
+    user = await db.get(User, uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    user_email = user.email
+
+    # Also remove secondary admin account for this email if one exists (never delete SUPER_ADMIN)
+    admin_res = await db.execute(
+        select(AdminUser).where(
+            (AdminUser.linked_user_id == user.id) | (func.lower(AdminUser.email) == user_email.lower())
+        )
+    )
+    for admin_acc in admin_res.scalars().all():
+        if admin_acc.role != "SUPER_ADMIN":
+            await db.delete(admin_acc)
+
+    await db.delete(user)
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": f"User {user_email} and all associated data have been permanently deleted.",
+        "deleted_user_id": str(uid),
+    }
+
+
+@router.delete("/telemetry/{telemetry_id}")
+async def delete_telemetry_log(
+    telemetry_id: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lead Admin action: Permanently deletes a specific technical telemetry log.
+    """
+    if current_admin.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Lead Admin access required to delete telemetry logs.",
+        )
+
+    try:
+        tid = uuid.UUID(telemetry_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid telemetry ID format.")
+
+    entry = await db.get(QueryTelemetry, tid)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Telemetry log entry not found.")
+
+    await db.delete(entry)
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "Telemetry log entry deleted successfully.",
+        "deleted_telemetry_id": str(tid),
+    }

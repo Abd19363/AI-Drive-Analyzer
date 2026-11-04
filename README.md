@@ -73,7 +73,7 @@ The end-to-end journey for a user interacting with the platform:
 
 4. **Instant Cache Delivery vs. Live Analysis:**
    - **Cache Hit:** If an identical question (within the same file scope and user context) was recently asked, the system returns the verified answer **instantaneously (in milliseconds)** without re-reading or analyzing any files.
-   - **Live Analysis:** If the answer is not cached, the backend executes the deep RAG analysis pipeline. Sparse or image-heavy PDF pages are OCRed with Tesseract before privacy screening and indexing, including pages with selectable scanner watermarks. For an explicitly selected PDF and a candidate/party list question, OCR text is screened, targeted pages receive a bounded visual OCR refinement, and the complete extracted text is supplied to answer generation without waiting for semantic embeddings. The live workflow is budgeted below 30 seconds; actual latency still depends on Drive and model services. Existing file indexes are refreshed when the extraction pipeline changes.
+   - **Live Analysis:** On an answer-cache miss, the backend compares the query with names of files and folders (including nested folder paths) before deciding to answer generally. A name match routes the request to that file or folder first; names are used only for routing, never as answer evidence. If the matched content does not answer the query, semantic retrieval searches the other indexed Drive documents before offering a general answer. Sparse or image-heavy PDF pages are OCRed with Tesseract before privacy screening and indexing, including pages with selectable scanner watermarks. Candidate-list requests for a named constituency exclude files explicitly identified as another constituency, while files without a constituency code remain eligible. For candidate-party or candidate-symbol questions, OCR text is screened, targeted pages receive bounded visual OCR refinement, and the complete extracted text is supplied without semantic embeddings. Unchanged files reuse their screened OCR text for later questions instead of repeating extraction. The backend logs total `/ask` response time; completion time depends on Drive and model services. Extraction version 6 forces older indexed files to be scanned again with the current OCR pipeline.
 
 5. **Review the Formatted Answer:**
    - The assistant outputs clear, descriptive, and structured answers formatted in modern Markdown:
@@ -202,8 +202,9 @@ When an answer is not cached, the compiled **LangGraph state machine (`rag_graph
 
 #### Step 1: Candidate File Routing (`node_analyze_query`)
 - **Explicit Selection:** If the user checked specific files in the UI, only those file IDs are used.
-- **Filename-First Routing:** With a warm Drive catalog, strong filename matches (score ≥55) bypass the general-vs-Drive LLM classifier; ambiguous or weak matches retain the existing fallback.
-- **AI Auto-Discovery:** If no files were selected, Gemini Flash analyzes the question against the user's Drive file catalog (names, MIME types, folder structure); at most 3 candidate files proceed to content checks.
+- **Content-First Routing:** Previously screened and indexed document text is searched before filenames are used to shortlist uncached Drive files. Filename matches never establish answer facts; generated answers must be grounded in retrieved document content.
+- **Hybrid Intent Classification:** Clear, stable general-knowledge questions use the direct answer path. Explicit file requests and exact, current, official, or paired-record questions are checked against Drive first. Ambiguous requests use query-only AI classification; file names do not decide whether a question is general or Drive-based.
+- **AI Auto-Discovery:** If no files were selected and cached content does not answer the query, Gemini Flash and title relevance identify up to 3 candidate files from the Drive catalog for content checks.
 - **Lazy Folder Lookup:** Query handling reads a shallow file catalog first and expands only folders selected as candidates; it does not crawl every folder before candidate selection.
 - **Media Filter:** Queries asking about images or videos are intercepted early with a redirect response (`Please ask query about textual files`).
 
@@ -214,9 +215,9 @@ When an answer is not cached, the compiled **LangGraph state machine (`rag_graph
 
 #### Step 3: On-Demand Extraction & Chunking (`node_embed_content`)
 - Safe candidate files are streamed on-demand from Google Drive.
-- Only the safe candidate files for the current query are extracted and indexed; the pipeline does not pre-embed the whole Drive. Selected candidate/party-list PDF queries store text-only chunks and skip semantic embedding so OCR text can reach answer generation promptly.
+- Only the safe candidate files for the current query are extracted and indexed; the pipeline does not pre-embed the whole Drive. Selected candidate-list PDF queries store text-only chunks and skip semantic embedding so OCR text can reach answer generation promptly. If the file is unchanged, subsequent questions reuse the screened chunks rather than downloading and OCRing the PDF again.
 - Multi-format text extraction:
-  - **PDF Documents:** Text is extracted using `pypdf`, backed by `fontTools` to parse embedded CFF Type1 fonts and non-standard character encodings. Sparse or image-heavy pages are OCRed locally with Tesseract; selected candidate-list queries can receive bounded visual OCR refinement.
+  - **PDF Documents:** Text is extracted using `pypdf`, backed by `fontTools` to parse embedded CFF Type1 fonts and non-standard character encodings. Sparse or image-heavy pages are OCRed locally with Tesseract; candidate-party and candidate-symbol list queries can receive bounded visual OCR refinement.
   - **Excel Spreadsheets (`.xlsx`, `.xls`):** Parsed via `openpyxl`. If the user asked about a specific worksheet (e.g., `"Sales Data"`), the parser extracts only that worksheet.
   - **Word Documents (`.docx`):** Extracted via `python-docx` table and paragraph iterators.
   - **Plain Text / CSV:** Streamed and decoded directly.

@@ -19,6 +19,10 @@ class User(Base):
     full_name = Column(String(255), nullable=True)
     reset_code = Column(String(20), nullable=True)
     reset_code_expires_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    assigned_tokens = Column(Integer, default=50000, nullable=False)
+    subscription_duration = Column(String(50), default="1_month", nullable=True) # "1_week", "3_weeks", "1_month", "6_months", "1_year"
+    token_expires_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    tokens_assigned_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
     updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -26,6 +30,7 @@ class User(Base):
     drive_files = relationship("DriveFile", back_populates="user", cascade="all, delete-orphan")
     chunks = relationship("DocumentChunk", back_populates="user", cascade="all, delete-orphan")
     queries = relationship("ChatQuery", back_populates="user", cascade="all, delete-orphan")
+    chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
 
 
 class GoogleAccount(Base):
@@ -112,20 +117,40 @@ class EmbeddingCache(Base):
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False, default="New Chat")
+    messages = Column(JSONB, default=list)
+    is_deleted = Column(Boolean, default=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, index=True)
+    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="chat_sessions")
+    queries = relationship("ChatQuery", back_populates="session", cascade="all, delete-orphan")
+
+
 class ChatQuery(Base):
     __tablename__ = "chat_queries"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
     query_text = Column(Text, nullable=False)
     identified_files = Column(JSONB, default=list) # files analyzed
     skipped_files = Column(JSONB, default=list)
     source_file_names = Column(JSONB, default=list) # files referenced
     responding_file_name = Column(String(500), nullable=True) # file name from which system responds
     answer_text = Column(Text, nullable=True)
+    prompt_tokens = Column(Integer, default=0, nullable=False)
+    completion_tokens = Column(Integer, default=0, nullable=False)
+    total_tokens = Column(Integer, default=0, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     user = relationship("User", back_populates="queries")
+    session = relationship("ChatSession", back_populates="queries")
 
 
 class AdminUser(Base):

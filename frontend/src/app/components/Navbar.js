@@ -2,6 +2,8 @@ import { HardDrive, RefreshCw, Shield, ShieldCheck, User, LogOut } from "lucide-
 
 export default function Navbar({
   isConnected,
+  portalEmail,
+  googleEmail,
   userEmail,
   onRefresh,
   isRefreshing,
@@ -61,11 +63,18 @@ export default function Navbar({
       <div className="flex items-center gap-3">
         {isUserAuthenticated ? (
           <>
-            {isConnected ? (
+            {portalEmail && (
+              <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-lg text-slate-700 bg-slate-100/90 border border-slate-200">
+                <User size={12} className="text-slate-500" />
+                <span className="truncate max-w-[150px]" title={portalEmail}>{portalEmail}</span>
+              </span>
+            )}
+
+            {isConnected && (googleEmail || userEmail) ? (
               <>
                 <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                  Drive: {userEmail}
+                  Drive: {googleEmail || userEmail}
                 </span>
                 <span className="text-slate-300">|</span>
                 <button
@@ -98,7 +107,7 @@ export default function Navbar({
             <button
               onClick={onUserLogout}
               className="text-xs font-semibold text-rose-600 hover:text-rose-700 transition-all flex items-center gap-1 px-2.5 py-1 rounded-lg hover:bg-rose-50 border border-transparent hover:border-rose-200"
-              title="Sign out of User Portal"
+              title={isConnected ? "Please disconnect Google Drive before signing out" : "Sign out of User Portal"}
             >
               <LogOut size={13} />
               Sign Out
