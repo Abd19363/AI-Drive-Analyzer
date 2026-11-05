@@ -163,7 +163,10 @@ export default function FileList({
       const mime = (f.mime_type || f.mimeType || "").toLowerCase();
       return mime.includes("pdf") || name.endsWith(".pdf");
     }
-    return true; // "all"
+    if (activeTab === "all") {
+      return !isF; // All Files tab displays all documents & data files directly
+    }
+    return true;
   });
 
   // Search filter
@@ -172,14 +175,12 @@ export default function FileList({
     (f.name || "").toLowerCase().includes(searchFilter.toLowerCase().trim())
   );
 
-  // Group into hierarchical roots when not searching
+  // Group into hierarchical roots when viewing folders, or flat list for file categories
   const allFolderIds = new Set(files.filter(isFolder).map((f) => f.id));
   const rootDisplayItems = isSearching
     ? searchMatchedFiles
     : activeTab === "folders"
     ? categoryFiltered.filter((f) => isFolder(f) && (!f.parent_id || !allFolderIds.has(f.parent_id)))
-    : activeTab === "all"
-    ? categoryFiltered.filter((f) => !f.parent_id || !allFolderIds.has(f.parent_id))
     : categoryFiltered;
 
   const allFilteredSelected =

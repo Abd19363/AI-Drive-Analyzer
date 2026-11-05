@@ -35,7 +35,7 @@ import {
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-export default function AdminPortal({ onBackToUserPortal, userId, userEmail }) {
+export default function AdminPortal({ onBackToUserPortal, userId, userEmail, onGoToLanding }) {
   const [adminToken, setAdminToken] = useState(null);
   const [adminProfile, setAdminProfile] = useState(null);
   const [selectedRole, setSelectedRole] = useState(userId ? "USER_ADMIN" : "LEAD_ADMIN"); // "LEAD_ADMIN" | "USER_ADMIN"
@@ -585,13 +585,17 @@ export default function AdminPortal({ onBackToUserPortal, userId, userEmail }) {
 
   const renderAdminTopBar = (badgeText = "ADMIN PORTAL") => (
     <header className="sticky top-0 z-50 flex items-center justify-between px-8 py-3.5 border-b border-slate-200/80 bg-white/95 backdrop-blur-md">
-      <div className="flex items-center gap-3">
-        <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-sm shadow-indigo-500/20 flex-shrink-0">
+      <div 
+        className="flex items-center gap-3 cursor-pointer group"
+        onClick={onGoToLanding}
+        title="View AI Drive Assistant Landing Page"
+      >
+        <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-purple-600 group-hover:from-indigo-700 group-hover:to-purple-700 flex items-center justify-center text-white shadow-sm shadow-indigo-500/20 flex-shrink-0 transition-colors">
           <Shield size={18} />
         </div>
         <div className="flex items-center gap-2.5">
-          <span className="font-heading text-base font-bold text-slate-900 tracking-tight">
-            AI-Drive Analyzer
+          <span className="font-heading text-base font-bold text-slate-900 tracking-tight group-hover:text-indigo-600 transition-colors">
+            AI Drive Assistant
           </span>
           <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200">
             <ShieldCheck size={11} className="stroke-[2.5]" />
@@ -602,6 +606,17 @@ export default function AdminPortal({ onBackToUserPortal, userId, userEmail }) {
 
       {/* Portal Switcher Tabs in Admin Header */}
       <div className="flex items-center p-1 bg-slate-100/90 rounded-xl border border-slate-200/80 shadow-2xs">
+        {onGoToLanding && (
+          <button
+            type="button"
+            onClick={onGoToLanding}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 hover:text-slate-800 transition-all cursor-pointer"
+            title="Return to Product Overview Landing Page"
+          >
+            <Sparkles size={13} className="text-blue-600" />
+            <span className="hidden sm:inline">Product</span> Overview
+          </button>
+        )}
         <button
           type="button"
           onClick={onBackToUserPortal}
@@ -730,40 +745,6 @@ export default function AdminPortal({ onBackToUserPortal, userId, userEmail }) {
                     No Lead Admin exists yet. Registering below permanently activates the primary Lead Admin account with immediate full access.
                   </p>
                 </div>
-              </div>
-            )}
-
-            {/* Sub-toggle for User Admin (Sign In vs Request Access) */}
-            {!isLeadRole && authMode !== "forgot" && (
-              <div className="flex items-center p-1 bg-slate-50 rounded-xl mb-5 border border-slate-200/60">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode("login");
-                    setAuthError(null);
-                    setAuthSuccess(null);
-                  }}
-                  className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${authMode === "login"
-                    ? "bg-white text-slate-900 shadow-2xs border border-slate-200/50"
-                    : "text-slate-500 hover:text-slate-800"
-                    }`}
-                >
-                  User Admin Sign In
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode("register");
-                    setAuthError(null);
-                    setAuthSuccess(null);
-                  }}
-                  className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${authMode === "register"
-                    ? "bg-white text-slate-900 shadow-2xs border border-slate-200/50"
-                    : "text-slate-500 hover:text-slate-800"
-                    }`}
-                >
-                  Request User Admin Access
-                </button>
               </div>
             )}
 
@@ -955,23 +936,6 @@ export default function AdminPortal({ onBackToUserPortal, userId, userEmail }) {
                   {authLoading ? <Loader2 size={14} className="animate-spin" /> : <Lock size={13} />}
                   {authLoading ? "Verifying Credentials..." : "Sign In as User Admin"}
                 </button>
-
-                <div className="mt-3 pt-3 border-t border-slate-100 text-center">
-                  <p className="text-[11px] text-slate-400">
-                    Don't have User Admin access yet?{" "}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setAuthMode("register");
-                        setAuthError(null);
-                        setAuthSuccess(null);
-                      }}
-                      className="text-blue-600 font-semibold hover:underline"
-                    >
-                      Register Admin Account
-                    </button>
-                  </p>
-                </div>
               </form>
             )}
 

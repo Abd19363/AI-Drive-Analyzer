@@ -8,6 +8,7 @@ import ChatInterface from "./components/ChatInterface";
 import AuditLogsModal from "./components/AuditLogsModal";
 import AdminPortal from "./components/AdminPortal";
 import UserPortalAuth from "./components/UserPortalAuth";
+import LandingPage from "./components/LandingPage";
 import { AlertCircle, CheckCircle2, X, AlertTriangle, LogOut, RefreshCw } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
@@ -26,6 +27,7 @@ async function fetchBackend(url, options) {
 }
 
 export default function Home() {
+  const [showLanding, setShowLanding] = useState(true);
   const [currentPortal, setCurrentPortal] = useState("user"); // "user" | "admin"
   const [userId, setUserId] = useState(null);
   const [portalEmail, setPortalEmail] = useState("");
@@ -53,9 +55,13 @@ export default function Home() {
       const portalParam = params.get("portal");
       if (portalParam === "admin") {
         setCurrentPortal("admin");
+        setShowLanding(false);
       }
       const urlUserId = params.get("user_id");
       const connectedParam = params.get("connected");
+      if (connectedParam === "true") {
+        setShowLanding(false);
+      }
       const errorParam = params.get("error");
 
       if (errorParam) {
@@ -398,7 +404,6 @@ export default function Home() {
     sessionId = null
   ) => {
     if (!userId) throw new Error("Please sign in to the User Portal first.");
-    if (!isConnected) throw new Error("Please connect your Google Drive above to analyze your documents.");
     setIsProcessingQuery(true);
     setCurrentStep("ANALYZING");
     const queryId = requestedQueryId || crypto.randomUUID();
@@ -494,6 +499,19 @@ export default function Home() {
 
   const selectedFilesList = driveFiles.filter((f) => selectedFileIds.includes(f.id));
 
+  if (showLanding) {
+    return (
+      <LandingPage
+        onContinue={() => {
+          setShowLanding(false);
+          if (typeof window !== "undefined") {
+            sessionStorage.setItem("ai_drive_visited_landing", "true");
+          }
+        }}
+      />
+    );
+  }
+
   return (
     <main className="min-h-screen">
       {currentPortal === "admin" ? (
@@ -501,6 +519,7 @@ export default function Home() {
           onBackToUserPortal={() => setCurrentPortal("user")}
           userId={userId}
           userEmail={portalEmail}
+          onGoToLanding={() => setShowLanding(true)}
         />
       ) : (
         <>
@@ -515,6 +534,7 @@ export default function Home() {
             onSelectPortal={setCurrentPortal}
             isUserAuthenticated={Boolean(userId)}
             onUserLogout={handleUserLogout}
+            onGoToLanding={() => setShowLanding(true)}
           />
 
           {!userId ? (

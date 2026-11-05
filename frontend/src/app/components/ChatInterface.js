@@ -141,8 +141,9 @@ export default function ChatInterface({
             }
           }
         } else {
-          // User has no sessions in DB; initialize the first one
-          await createNewSession("New Chat");
+          // No active sessions
+          setActiveSessionId(null);
+          setMessages([]);
         }
       }
     } catch (err) {
@@ -331,44 +332,11 @@ export default function ChatInterface({
             }
           }
         } else {
-          // If NO sessions remain: reset view and create a single clean session
-          const initialMsgs = [
-            {
-              ...DEFAULT_WELCOME_MESSAGE,
-              id: `welcome-${Date.now()}`,
-              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-            },
-          ];
-          setMessages(initialMsgs);
-          if (userId) {
-            try {
-              const createRes = await fetch(`${BACKEND_URL}/api/rag/sessions`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  user_id: userId,
-                  title: "New Chat",
-                  messages: initialMsgs,
-                }),
-              });
-              if (createRes.ok) {
-                const freshSession = await createRes.json();
-                setSessions([freshSession]);
-                setActiveSessionId(freshSession.id);
-                localStorage.setItem(`ai_drive_active_session_${userId}`, freshSession.id);
-                localStorage.setItem(`ai_drive_session_msgs_${freshSession.id}`, JSON.stringify(initialMsgs));
-              } else {
-                setSessions([]);
-                setActiveSessionId(null);
-              }
-            } catch (e) {
-              setSessions([]);
-              setActiveSessionId(null);
-            }
-          } else {
-            setSessions([]);
-            setActiveSessionId(null);
-          }
+          // If NO sessions remain: cleanly delete without resurrecting a new chat
+          setSessions([]);
+          setActiveSessionId(null);
+          setMessages([]);
+          localStorage.removeItem(`ai_drive_active_session_${userId}`);
         }
       }
     } catch (err) {
@@ -402,29 +370,51 @@ export default function ChatInterface({
     }
   };
 
-  // Auto-name session from first query
-  const checkAndUpdateSessionTitle = (queryText) => {
-    if (!activeSessionId) return;
-    const currentSession = sessions.find((s) => s.id === activeSessionId);
-    if (currentSession && (currentSession.title === "New Chat" || !currentSession.title)) {
-      const cleanTitle = queryText.length > 35 ? queryText.slice(0, 32).trim() + "..." : queryText.trim();
-      setSessions((prev) =>
-        prev.map((s) => (s.id === activeSessionId ? { ...s, title: cleanTitle } : s))
-      );
-      fetch(`${BACKEND_URL}/api/rag/sessions/${activeSessionId}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_id: userId,
-          title: cleanTitle,
-        }),
-      }).catch(() => {});
+  // Auto-name session from first query with Gemini-generated 3 to 4 word summary
+  const checkAndUpdateSessionTitle = async (queryText, targetSessionId = activeSessionId) => {
+    if (!targetSessionId || !userId) return;
+    const currentSession = sessions.find((s) => s.id === targetSessionId);
+    if (!currentSession || currentSession.title === "New Chat" || !currentSession.title || currentSession.title === "Untitled Chat") {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/rag/generate-title`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: queryText }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const cleanTitle = data.title;
+          if (cleanTitle) {
+            setSessions((prev) =>
+              prev.map((s) => (s.id === targetSessionId ? { ...s, title: cleanTitle } : s))
+            );
+            fetch(`${BACKEND_URL}/api/rag/sessions/${targetSessionId}`, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                user_id: userId,
+                title: cleanTitle,
+              }),
+            }).catch(() => {});
+          }
+        }
+      } catch (err) {
+        console.error("[Chat] Failed to generate summarized session title:", err);
+      }
     }
   };
 
   const handleSend = async (e) => {
     if (e) e.preventDefault();
     if (!inputQuery.trim() || isProcessing) return;
+
+    let targetSessionId = activeSessionId;
+    if (!targetSessionId) {
+      const freshSession = await createNewSession("New Chat");
+      if (freshSession) {
+        targetSessionId = freshSession.id;
+      }
+    }
 
     const startedAt = performance.now();
     const queryId = crypto.randomUUID();
@@ -447,7 +437,7 @@ export default function ChatInterface({
       },
     ]);
 
-    checkAndUpdateSessionTitle(userText);
+    checkAndUpdateSessionTitle(userText, targetSessionId);
     console.log("[Chat] Sending query:", userText);
 
     try {
@@ -458,7 +448,7 @@ export default function ChatInterface({
         [],
         false,
         queryId,
-        activeSessionId
+        targetSessionId
       );
       console.log("[RAG Response]", response);
       setMessages((prev) => [
@@ -670,7 +660,9 @@ export default function ChatInterface({
     }
   };
 
-  const currentSessionTitle = sessions.find((s) => s.id === activeSessionId)?.title || "Active Chat";
+  const currentSessionTitle =
+    sessions.find((s) => s.id === activeSessionId)?.title ||
+    (sessions.length === 0 ? "No Active Chat" : "Active Chat");
 
   return (
     <div className="bg-white border border-slate-200/80 rounded-2xl shadow-xs flex flex-col h-[700px] overflow-hidden">
@@ -703,38 +695,44 @@ export default function ChatInterface({
                 </button>
               </div>
               <div className="max-h-60 overflow-y-auto py-1">
-                {sessions.map((sess) => {
-                  const isActive = sess.id === activeSessionId;
-                  return (
-                    <div
-                      key={sess.id}
-                      onClick={() => handleSelectSession(sess.id)}
-                      className={`px-3 py-2 flex items-center justify-between cursor-pointer transition-colors ${
-                        isActive ? "bg-blue-50 text-blue-900 font-semibold" : "hover:bg-slate-50 text-slate-700"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 min-w-0 pr-2">
-                        <MessageSquare size={12} className={isActive ? "text-blue-600" : "text-slate-400"} />
-                        <span className="text-xs truncate">{sess.title || "Untitled Chat"}</span>
+                {sessions.length === 0 ? (
+                  <div className="px-4 py-3 text-center text-xs text-slate-400">
+                    No active chat sessions.
+                  </div>
+                ) : (
+                  sessions.map((sess) => {
+                    const isActive = sess.id === activeSessionId;
+                    return (
+                      <div
+                        key={sess.id}
+                        onClick={() => handleSelectSession(sess.id)}
+                        className={`px-3 py-2 flex items-center justify-between cursor-pointer transition-colors ${
+                          isActive ? "bg-blue-50 text-blue-900 font-semibold" : "hover:bg-slate-50 text-slate-700"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0 pr-2">
+                          <MessageSquare size={12} className={isActive ? "text-blue-600" : "text-slate-400"} />
+                          <span className="text-xs truncate">{sess.title || "Untitled Chat"}</span>
+                        </div>
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          {sess.message_count > 0 && (
+                            <span className="text-[10px] text-slate-400 px-1 rounded bg-slate-100">
+                              {sess.message_count}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={(e) => handleDeleteSession(e, sess.id)}
+                            className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors"
+                            title="Delete session"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1 flex-shrink-0">
-                        {sess.message_count > 0 && (
-                          <span className="text-[10px] text-slate-400 px-1 rounded bg-slate-100">
-                            {sess.message_count}
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={(e) => handleDeleteSession(e, sess.id)}
-                          className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors"
-                          title="Delete session"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </div>
             </div>
           )}
@@ -853,7 +851,28 @@ export default function ChatInterface({
 
       {/* 3. Messages Stream */}
       <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-5 scrollbar-thin scrollbar-thumb-slate-200">
-        {messages.map((msg) => {
+        {!activeSessionId || sessions.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center py-20 px-4 text-center my-auto animate-fade-in">
+            <div className="w-16 h-16 rounded-3xl bg-blue-50 border border-blue-200/80 flex items-center justify-center text-blue-600 mb-4 shadow-sm shadow-blue-500/10">
+              <MessageSquare size={32} />
+            </div>
+            <h3 className="font-heading text-lg font-bold text-slate-800 mb-1.5">
+              No Active Chat Session
+            </h3>
+            <p className="text-xs text-slate-500 max-w-sm mb-6 leading-relaxed">
+              Start a new conversation to ask questions about your documents, analyze spreadsheets, or chat with AI Drive Assistant.
+            </p>
+            <button
+              type="button"
+              onClick={() => createNewSession("New Chat")}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-lg shadow-blue-500/25 active:scale-95 transition-all cursor-pointer"
+            >
+              <Plus size={16} />
+              <span>Start Chat</span>
+            </button>
+          </div>
+        ) : (
+          messages.map((msg) => {
           const isUser = msg.sender === "user";
 
           if (isUser) {
@@ -1021,7 +1040,8 @@ export default function ChatInterface({
               </div>
             </div>
           );
-        })}
+        })
+      )}
 
         {/* Processing Spinner Indicator */}
         {isProcessing && (

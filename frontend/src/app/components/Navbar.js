@@ -1,4 +1,4 @@
-import { HardDrive, RefreshCw, Shield, ShieldCheck, User, LogOut } from "lucide-react";
+import { HardDrive, RefreshCw, Shield, ShieldCheck, User, LogOut, Sparkles } from "lucide-react";
 
 export default function Navbar({
   isConnected,
@@ -12,17 +12,22 @@ export default function Navbar({
   onSelectPortal,
   isUserAuthenticated = false,
   onUserLogout,
+  onGoToLanding,
 }) {
   return (
     <header className="sticky top-0 z-50 flex items-center justify-between px-8 py-3.5 border-b border-slate-200/80 bg-white/90 backdrop-blur-md">
       {/* Logo & Brand */}
-      <div className="flex items-center gap-3">
-        <div className="w-8 h-8 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-sm shadow-blue-500/20 flex-shrink-0">
+      <div 
+        className="flex items-center gap-3 cursor-pointer group"
+        onClick={onGoToLanding}
+        title="View AI Drive Assistant Landing Page"
+      >
+        <div className="w-8 h-8 rounded-xl bg-blue-600 group-hover:bg-blue-700 flex items-center justify-center text-white shadow-sm shadow-blue-500/20 flex-shrink-0 transition-colors">
           <HardDrive size={18} />
         </div>
         <div className="flex items-center gap-2.5">
-          <span className="font-heading text-base font-bold text-slate-900 tracking-tight">
-            AI-Drive Analyzer
+          <span className="font-heading text-base font-bold text-slate-900 tracking-tight group-hover:text-blue-600 transition-colors">
+            AI Drive Assistant
           </span>
           <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-600 border border-emerald-200/80">
             <ShieldCheck size={11} className="stroke-[2.5]" />
@@ -31,8 +36,19 @@ export default function Navbar({
         </div>
       </div>
 
-      {/* Portal Switcher (User Portal vs Admin Portal) */}
+      {/* Portal Switcher (Overview vs User Portal vs Admin Portal) */}
       <div className="flex items-center p-1 bg-slate-100/90 rounded-xl border border-slate-200/80 shadow-2xs">
+        {onGoToLanding && (
+          <button
+            type="button"
+            onClick={onGoToLanding}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 hover:text-slate-800 transition-all cursor-pointer"
+            title="Return to Product Overview Landing Page"
+          >
+            <Sparkles size={13} className="text-blue-600" />
+            <span className="hidden sm:inline">Product</span> Overview
+          </button>
+        )}
         <button
           type="button"
           onClick={() => onSelectPortal && onSelectPortal("user")}

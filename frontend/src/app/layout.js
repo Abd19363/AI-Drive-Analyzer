@@ -1,7 +1,7 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "AI-Drive Analyzer | Secure Document Intelligence",
+  title: "AI Drive Assistant | Intelligent Google Drive Co-Pilot",
   description: "Secure, intelligent document search and analysis for Google Drive with multi-layer privacy protection.",
 };
 

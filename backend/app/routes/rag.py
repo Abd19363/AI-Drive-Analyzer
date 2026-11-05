@@ -71,6 +71,10 @@ class CreateSessionRequest(BaseModel):
     messages: Optional[List[Dict[str, Any]]] = None
 
 
+class GenerateTitleRequest(BaseModel):
+    query: str
+
+
 class UpdateSessionRequest(BaseModel):
     user_id: str
     title: Optional[str] = None
@@ -1039,7 +1043,7 @@ async def _ask_question_uncached(
         acc_res = await db.execute(select(GoogleAccount).where(GoogleAccount.user_id == user_id))
         google_acc = acc_res.scalars().first()
         if not google_acc:
-            answer = "Google Drive isn't connected to check for files. Please connect your Google Drive first."
+            answer = "You currently do not have a Google Drive connected. Once you connect your Google Drive above, I can list and index your Drive files. In the meantime, feel free to ask me any general questions!"
             await _save_answer(db, user_id, query, answer, intent, "assistant", selected_file_ids=selected_file_ids)
             return _answer_response(query, intent, answer, analysis_required=False, answer_source="assistant")
 
@@ -1260,24 +1264,55 @@ async def _ask_question_uncached(
     acc_res = await db.execute(select(GoogleAccount).where(GoogleAccount.user_id == user_id))
     google_acc = acc_res.scalars().first()
     if not google_acc:
-        answer = (
-            "I couldn't find this information in your indexed documents, and "
-            "Google Drive isn't connected to check for a matching file. "
-            "Would you like me to answer using general knowledge instead?"
-        )
-        await _save_answer(
-            db, user_id, query, answer, intent, "insufficient",
-            selected_file_ids=selected_file_ids,
-        )
-        return _answer_response(
-            query,
-            intent,
-            answer,
-            analysis_required=False,
-            needs_general_confirmation=True,
-            answer_source="insufficient_drive_evidence",
-            matched_file_ids=matched_file_ids,
-        )
+        t0_gen = time.perf_counter()
+        try:
+            answer = await answer_general_query(query)
+            latency_ms = (time.perf_counter() - t0_gen) * 1000.0
+            p_tok = max(1, len(query) // 4)
+            c_tok = max(1, len(answer) // 4)
+            await _record_telemetry(
+                db,
+                user_id=user_id,
+                latency_ms=latency_ms,
+                cache_hit=False,
+                api_called=True,
+                intent=intent or "general",
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                query_id=payload.query_id,
+            )
+            await _save_answer(
+                db,
+                user_id,
+                query,
+                answer,
+                intent or "general",
+                "general_knowledge",
+                selected_file_ids=selected_file_ids,
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                total_tokens=p_tok + c_tok,
+            )
+            return _answer_response(
+                query,
+                intent,
+                answer,
+                analysis_required=False,
+                answer_source="general_knowledge",
+                matched_file_ids=matched_file_ids,
+            )
+        except Exception as exc:
+            logger.warning(f"[RAG] Error answering general query when drive disconnected: {exc}")
+            answer = f"I'm here to help! Regarding your question '{query}', I can provide general guidance and answers. (Connect your Google Drive anytime to search your personal documents.)"
+            await _save_answer(db, user_id, query, answer, intent or "general", "general_knowledge", selected_file_ids=selected_file_ids)
+            return _answer_response(
+                query,
+                intent,
+                answer,
+                analysis_required=False,
+                answer_source="general_knowledge",
+                matched_file_ids=matched_file_ids,
+            )
 
     current_task = asyncio.current_task()
     if payload.query_id and current_task:
@@ -1759,3 +1794,56 @@ async def clear_chat_session(
     session.updated_at = datetime.utcnow()
     await db.commit()
     return {"cleared": True, "id": str(session.id), "messages": session.messages}
+
+
+@router.post("/generate-title")
+async def generate_chat_title(payload: GenerateTitleRequest):
+    """
+    Summarize the user's first query into a concise 3 to 4 word chat session title.
+    """
+    import re
+    query = (payload.query or "").strip()
+    if not query:
+        return {"title": "New Chat"}
+
+    # 1. Try Gemini summarization
+    try:
+        from app.services.gemini_service import get_gemini_client, generate_content_with_fallback
+        from google.genai import types
+
+        client = get_gemini_client()
+        prompt = (
+            "Summarize the following user query into a concise 3 to 4 word title for a chat session. "
+            "Do not use quotes, punctuation, asterisks, brackets, or generic phrases like 'Question About' or 'Query On'. "
+            "Return ONLY the 3 to 4 words representing the main subject.\n\n"
+            f"User Query: {query}"
+        )
+        config = types.GenerateContentConfig(temperature=0.2, max_output_tokens=30)
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(generate_content_with_fallback, client, prompt, config),
+            timeout=5.0,
+        )
+        raw_title = (resp.text or "").strip().strip('"\'`*#.:;')
+        raw_title = re.sub(r"^(?:Title|Subject|Topic)\s*:\s*", "", raw_title, flags=re.I).strip()
+        words = raw_title.split()
+        if 2 <= len(words) <= 5:
+            clean_summary = " ".join(words[:4])
+            return {"title": clean_summary}
+    except Exception as exc:
+        logger.warning(f"[RAG] Gemini chat title generation error: {exc}")
+
+    # 2. Fallback heuristic: clean stopwords and extract 3-4 significant words
+    stopwords = {
+        "a", "an", "the", "in", "on", "at", "for", "to", "of", "and", "or", "is", "are", 
+        "was", "were", "what", "how", "why", "who", "give", "me", "show", "tell", "can", 
+        "you", "please", "about", "with", "from", "do", "does", "did", "my", "your"
+    }
+    tokens = [w for w in re.sub(r"[^\w\s]", "", query).split() if w.lower() not in stopwords]
+    if len(tokens) >= 3:
+        fallback_title = " ".join(tokens[:4]).title()
+    elif len(tokens) > 0:
+        fallback_title = " ".join(tokens).title()
+    else:
+        fallback_title = " ".join(query.split()[:4]).title()
+    return {"title": fallback_title or "New Chat"}
+
