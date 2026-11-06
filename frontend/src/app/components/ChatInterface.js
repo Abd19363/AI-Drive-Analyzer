@@ -21,6 +21,9 @@ import {
   Trash2,
   RotateCcw,
   ChevronDown,
+  ArrowDownToLine,
+  Download,
+  Upload,
 } from "lucide-react";
 import MarkdownRenderer from "./MarkdownRenderer";
 
@@ -47,15 +50,28 @@ function getStepState(stepKey, currentStep) {
   return "idle";
 }
 
-const DEFAULT_WELCOME_MESSAGE = {
-  id: "welcome-1",
-  sender: "ai",
-  text: "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
-  time: "Just now",
-  showSecurityNotice: true,
-  citations: [],
-  blockedFiles: [],
-};
+function getWelcomeMessage(isGeneral = false) {
+  if (isGeneral) {
+    return {
+      id: "welcome-general",
+      sender: "ai",
+      text: "Hello! I'm your AI Assistant for general questions. You can ask me anything about programming, drafting, mathematics, or conceptual problem-solving without connecting your Google Drive.",
+      time: "Just now",
+      showSecurityNotice: false,
+      citations: [],
+      blockedFiles: [],
+    };
+  }
+  return {
+    id: "welcome-drive",
+    sender: "ai",
+    text: "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
+    time: "Just now",
+    showSecurityNotice: true,
+    citations: [],
+    blockedFiles: [],
+  };
+}
 
 export default function ChatInterface({
   userId,
@@ -69,17 +85,28 @@ export default function ChatInterface({
   selectedFiles = [],
   selectedFileIds = [],
   onDeselectFile,
+  isGeneralMode = false,
 }) {
-  const [messages, setMessages] = useState([DEFAULT_WELCOME_MESSAGE]);
+  const [messages, setMessages] = useState(() => [getWelcomeMessage(isGeneralMode)]);
   const [inputQuery, setInputQuery] = useState("");
   const [copiedId, setCopiedId] = useState(null);
   const messagesEndRef = useRef(null);
+
+  const modeKey = isGeneralMode ? "general" : "drive";
 
   // Sessions State
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [isSessionMenuOpen, setIsSessionMenuOpen] = useState(false);
   const sessionMenuRef = useRef(null);
+
+  // Import Modal State (Cross-Mode & External File Import)
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [otherModeSessions, setOtherModeSessions] = useState([]);
+  const [isLoadingOtherSessions, setIsLoadingOtherSessions] = useState(false);
+  const [importingSessionId, setImportingSessionId] = useState(null);
+  const [importSuccessMsg, setImportSuccessMsg] = useState("");
+  const fileInputRef = useRef(null);
 
   // Close session dropdown when clicking outside
   useEffect(() => {
@@ -92,11 +119,11 @@ export default function ChatInterface({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // 1. Zero-delay Hydration from localStorage on mount
+  // 1. Zero-delay Hydration from localStorage on mount (mode-scoped)
   useEffect(() => {
     if (!userId || typeof window === "undefined") return;
     try {
-      const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}`);
+      const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}_${modeKey}`);
       if (savedSessionId) {
         setActiveSessionId(savedSessionId);
         const cached = localStorage.getItem(`ai_drive_session_msgs_${savedSessionId}`);
@@ -110,23 +137,23 @@ export default function ChatInterface({
     } catch (e) {
       console.error("[Chat] Error reading localStorage session cache:", e);
     }
-  }, [userId]);
+  }, [userId, modeKey]);
 
-  // 2. Fetch Sessions List & sync with server
+  // 2. Fetch Sessions List & sync with server (filtered by mode)
   const loadSessions = useCallback(async () => {
     if (!userId) return;
     try {
-      const res = await fetch(`${BACKEND_URL}/api/rag/sessions?user_id=${userId}`);
+      const res = await fetch(`${BACKEND_URL}/api/rag/sessions?user_id=${encodeURIComponent(userId)}&mode=${modeKey}`);
       if (res.ok) {
         const data = await res.json();
         const sessionList = data.sessions || [];
         setSessions(sessionList);
 
         if (sessionList.length > 0) {
-          const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}`);
+          const savedSessionId = localStorage.getItem(`ai_drive_active_session_${userId}_${modeKey}`);
           const targetSession = sessionList.find((s) => s.id === savedSessionId) || sessionList[0];
           setActiveSessionId(targetSession.id);
-          localStorage.setItem(`ai_drive_active_session_${userId}`, targetSession.id);
+          localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, targetSession.id);
 
           // Fetch full messages from server for target session
           const msgUrl = userId
@@ -141,15 +168,15 @@ export default function ChatInterface({
             }
           }
         } else {
-          // No active sessions
+          // No active sessions in this mode
           setActiveSessionId(null);
-          setMessages([]);
+          setMessages([getWelcomeMessage(isGeneralMode)]);
         }
       }
     } catch (err) {
       console.error("[Chat] Failed to load sessions from server:", err);
     }
-  }, [userId]);
+  }, [userId, modeKey, isGeneralMode]);
 
   useEffect(() => {
     if (userId) {
@@ -213,12 +240,12 @@ export default function ChatInterface({
     }
   };
 
-  // Create a new session
+  // Create a new session (scoped to current mode)
   const createNewSession = async (title = "New Chat") => {
     if (!userId) return;
     const initialMsgs = [
       {
-        ...DEFAULT_WELCOME_MESSAGE,
+        ...getWelcomeMessage(isGeneralMode),
         id: `welcome-${Date.now()}`,
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       },
@@ -229,6 +256,7 @@ export default function ChatInterface({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           user_id: userId,
+          mode: modeKey,
           title: title,
           messages: initialMsgs,
         }),
@@ -238,13 +266,143 @@ export default function ChatInterface({
         setSessions((prev) => [newSession, ...prev]);
         setActiveSessionId(newSession.id);
         setMessages(initialMsgs);
-        localStorage.setItem(`ai_drive_active_session_${userId}`, newSession.id);
+        localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, newSession.id);
         localStorage.setItem(`ai_drive_session_msgs_${newSession.id}`, JSON.stringify(initialMsgs));
         setIsSessionMenuOpen(false);
         return newSession;
       }
     } catch (err) {
       console.error("[Chat] Failed to create new session:", err);
+    }
+  };
+
+  // Open modal to import sessions from the other mode
+  const handleOpenImportModal = async () => {
+    setIsSessionMenuOpen(false);
+    setIsImportModalOpen(true);
+    setImportSuccessMsg("");
+    setIsLoadingOtherSessions(true);
+    try {
+      const res = await fetch(
+        `${BACKEND_URL}/api/rag/sessions/other_mode?user_id=${encodeURIComponent(userId)}&current_mode=${modeKey}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setOtherModeSessions(data.sessions || []);
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to load sessions from other mode:", err);
+    } finally {
+      setIsLoadingOtherSessions(false);
+    }
+  };
+
+  // Import a session from the other mode into the current mode
+  const handleImportSession = async (sessionId) => {
+    setImportingSessionId(sessionId);
+    try {
+      const res = await fetch(
+        `${BACKEND_URL}/api/rag/sessions/${sessionId}/import_to_mode`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: userId,
+            target_mode: modeKey,
+          }),
+        }
+      );
+      if (res.ok) {
+        const imported = await res.json();
+        setSessions((prev) => [imported, ...prev]);
+        setActiveSessionId(imported.id);
+        setMessages(imported.messages || []);
+        localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, imported.id);
+        localStorage.setItem(`ai_drive_session_msgs_${imported.id}`, JSON.stringify(imported.messages || []));
+        setImportSuccessMsg(`Session imported successfully!`);
+        setTimeout(() => {
+          setIsImportModalOpen(false);
+          setImportSuccessMsg("");
+        }, 1100);
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to import session:", err);
+    } finally {
+      setImportingSessionId(null);
+    }
+  };
+
+  // Export a chat session as a JSON file
+  const handleExportSession = (e, sessionId) => {
+    e.stopPropagation();
+    const sess = sessions.find((s) => s.id === sessionId);
+    if (!sess) return;
+    const msgsToExport =
+      sessionId === activeSessionId && messages.length > 0
+        ? messages
+        : JSON.parse(localStorage.getItem(`ai_drive_session_msgs_${sessionId}`) || "[]");
+    const exportData = {
+      title: sess.title || "Chat Session",
+      mode: modeKey,
+      exported_at: new Date().toISOString(),
+      messages: msgsToExport,
+    };
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(sess.title || "chat").replace(/[^a-z0-9]/gi, "_").toLowerCase()}_export.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Import a chat session from external JSON file
+  const handleImportJsonFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const msgs = Array.isArray(parsed.messages)
+        ? parsed.messages
+        : Array.isArray(parsed)
+        ? parsed
+        : null;
+      if (!msgs) {
+        alert("Invalid chat file format. Expected a list of messages.");
+        return;
+      }
+      const title = parsed.title ? `[Imported] ${parsed.title}` : `Imported ${file.name.replace(".json", "")}`;
+      const res = await fetch(`${BACKEND_URL}/api/rag/sessions/import_json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          mode: modeKey,
+          title: title,
+          messages: msgs,
+        }),
+      });
+      if (res.ok) {
+        const imported = await res.json();
+        setSessions((prev) => [imported, ...prev]);
+        setActiveSessionId(imported.id);
+        setMessages(imported.messages || []);
+        localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, imported.id);
+        localStorage.setItem(`ai_drive_session_msgs_${imported.id}`, JSON.stringify(imported.messages || []));
+        setImportSuccessMsg(`Chat file imported successfully!`);
+        setTimeout(() => {
+          setIsImportModalOpen(false);
+          setImportSuccessMsg("");
+        }, 1100);
+      }
+    } catch (err) {
+      console.error("[Chat] Failed to parse JSON file:", err);
+      alert("Failed to parse JSON chat file.");
     }
   };
 
@@ -255,7 +413,7 @@ export default function ChatInterface({
       return;
     }
     setActiveSessionId(sessionId);
-    localStorage.setItem(`ai_drive_active_session_${userId}`, sessionId);
+    localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, sessionId);
     setIsSessionMenuOpen(false);
 
     // Read cached messages immediately
@@ -306,7 +464,7 @@ export default function ChatInterface({
           if (activeSessionId === sessionId) {
             const nextSession = remaining[0];
             setActiveSessionId(nextSession.id);
-            localStorage.setItem(`ai_drive_active_session_${userId}`, nextSession.id);
+            localStorage.setItem(`ai_drive_active_session_${userId}_${modeKey}`, nextSession.id);
             // Fetch messages for next active session
             try {
               const nextMsgUrl = userId
@@ -319,7 +477,7 @@ export default function ChatInterface({
                   ? nextData.messages
                   : [
                       {
-                        ...DEFAULT_WELCOME_MESSAGE,
+                        ...getWelcomeMessage(isGeneralMode),
                         id: `welcome-${Date.now()}`,
                         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
                       },
@@ -336,7 +494,7 @@ export default function ChatInterface({
           setSessions([]);
           setActiveSessionId(null);
           setMessages([]);
-          localStorage.removeItem(`ai_drive_active_session_${userId}`);
+          localStorage.removeItem(`ai_drive_active_session_${userId}_${modeKey}`);
         }
       }
     } catch (err) {
@@ -348,7 +506,7 @@ export default function ChatInterface({
   const handleClearChat = async () => {
     const clearedMessages = [
       {
-        ...DEFAULT_WELCOME_MESSAGE,
+        ...getWelcomeMessage(isGeneralMode),
         id: `welcome-${Date.now()}`,
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       },
@@ -443,8 +601,8 @@ export default function ChatInterface({
     try {
       const response = await onAskQuestion(
         userText,
-        selectedFileIds,
-        false,
+        isGeneralMode ? [] : selectedFileIds,
+        isGeneralMode ? true : false,
         [],
         false,
         queryId,
@@ -458,15 +616,15 @@ export default function ChatInterface({
           sender: "ai",
           text: response?.answer || "No response received.",
           time: timeStr,
-          citations: Array.isArray(response?.retrieved_sources) ? response.retrieved_sources : [],
-          blockedFiles: Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : [],
-          autoDiscovered: response?.auto_discovered || false,
-          candidateFiles: Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : [],
-          answerSource: response?.answer_source,
-          needsGeneralConfirmation: response?.needs_general_confirmation || false,
+          citations: isGeneralMode ? [] : (Array.isArray(response?.retrieved_sources) ? response.retrieved_sources : []),
+          blockedFiles: isGeneralMode ? [] : (Array.isArray(response?.blocked_confidential_files) ? response.blocked_confidential_files : []),
+          autoDiscovered: isGeneralMode ? false : (response?.auto_discovered || false),
+          candidateFiles: isGeneralMode ? [] : (Array.isArray(response?.candidate_files) ? response.candidate_files.filter(Boolean) : []),
+          answerSource: isGeneralMode ? "general_knowledge" : response?.answer_source,
+          needsGeneralConfirmation: isGeneralMode ? false : (response?.needs_general_confirmation || false),
           originalQuery: userText,
-          originalFileIds: [...selectedFileIds],
-          matchedFileIds: response?.matched_file_ids || [],
+          originalFileIds: isGeneralMode ? [] : [...selectedFileIds],
+          matchedFileIds: isGeneralMode ? [] : (response?.matched_file_ids || []),
           intent: response?.intent || "general",
         },
       ]);
@@ -683,21 +841,31 @@ export default function ChatInterface({
           </button>
 
           {isSessionMenuOpen && (
-            <div className="absolute left-0 mt-1.5 w-72 bg-white border border-slate-200 rounded-xl shadow-lg z-50 py-1.5 animate-fade-in">
+            <div className="absolute left-0 mt-1.5 w-80 bg-white border border-slate-200 rounded-xl shadow-lg z-50 py-1.5 animate-fade-in">
               <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between border-b border-slate-100">
-                <span>Chat Sessions ({sessions.length})</span>
-                <button
-                  type="button"
-                  onClick={() => createNewSession("New Chat")}
-                  className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium normal-case cursor-pointer"
-                >
-                  <Plus size={12} /> New
-                </button>
+                <span>{isGeneralMode ? "General Chats" : "Drive Chats"} ({sessions.length})</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleOpenImportModal}
+                    className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-700 font-medium normal-case cursor-pointer text-[11px]"
+                    title={`Import chat from ${isGeneralMode ? "Google Drive" : "General Questions"}`}
+                  >
+                    <ArrowDownToLine size={11} /> Import
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => createNewSession("New Chat")}
+                    className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium normal-case cursor-pointer text-[11px]"
+                  >
+                    <Plus size={11} /> New
+                  </button>
+                </div>
               </div>
               <div className="max-h-60 overflow-y-auto py-1">
                 {sessions.length === 0 ? (
                   <div className="px-4 py-3 text-center text-xs text-slate-400">
-                    No active chat sessions.
+                    No active chat sessions in this mode.
                   </div>
                 ) : (
                   sessions.map((sess) => {
@@ -722,6 +890,14 @@ export default function ChatInterface({
                           )}
                           <button
                             type="button"
+                            onClick={(e) => handleExportSession(e, sess.id)}
+                            className="p-1 text-slate-400 hover:text-indigo-600 rounded transition-colors"
+                            title="Export session as JSON"
+                          >
+                            <Download size={12} />
+                          </button>
+                          <button
+                            type="button"
                             onClick={(e) => handleDeleteSession(e, sess.id)}
                             className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors"
                             title="Delete session"
@@ -739,6 +915,16 @@ export default function ChatInterface({
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleOpenImportModal}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200/90 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition-colors shadow-2xs cursor-pointer"
+            title={`Import a chat session from ${isGeneralMode ? "Google Drive mode" : "General Questions"}`}
+          >
+            <ArrowDownToLine size={13} className="text-indigo-600" />
+            <span className="hidden sm:inline">Import</span>
+          </button>
+
           <button
             type="button"
             onClick={() => createNewSession("New Chat")}
@@ -761,93 +947,98 @@ export default function ChatInterface({
         </div>
       </div>
 
-      {/* 1. Stepper Bar (matching exact design in screenshot) */}
-      <div className="px-6 pt-3 pb-2">
-        <div className="flex items-center gap-2 overflow-x-auto scrollbar-none py-1">
-          {PIPELINE_STEPS.map((step, idx) => {
-            const state = getStepState(step.key, currentStep);
-            const isFirst = idx === 0 && !currentStep; // Highlight first step as idle default
-            const isActive = state === "active" || (isFirst && !currentStep);
-            const isCompleted = state === "completed";
+      {/* Google Drive Document Pipeline & Discovery Banners (Only in Drive Mode) */}
+      {!isGeneralMode && (
+        <>
+          {/* 1. Stepper Bar */}
+          <div className="px-6 pt-3 pb-2">
+            <div className="flex items-center gap-2 overflow-x-auto scrollbar-none py-1">
+              {PIPELINE_STEPS.map((step, idx) => {
+                const state = getStepState(step.key, currentStep);
+                const isFirst = idx === 0 && !currentStep; // Highlight first step as idle default
+                const isActive = state === "active" || (isFirst && !currentStep);
+                const isCompleted = state === "completed";
 
-            return (
-              <div key={step.key} className="flex items-center gap-2 flex-shrink-0">
-                <div
-                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all ${
-                    isActive
-                      ? "bg-blue-50/80 border border-blue-200 text-blue-700 font-semibold shadow-2xs"
-                      : isCompleted
-                      ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                      : "text-slate-400"
-                  }`}
-                >
-                  <span
-                    className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                      isActive
-                        ? "bg-blue-600 text-white"
-                        : isCompleted
-                        ? "bg-emerald-600 text-white"
-                        : "bg-slate-100 text-slate-500"
-                    }`}
-                  >
-                    {isCompleted ? "✓" : step.stepNum}
-                  </span>
-                  <span>{step.label}</span>
-                </div>
-
-                {idx < PIPELINE_STEPS.length - 1 && (
-                  <ChevronRight size={13} className="text-slate-300 flex-shrink-0" />
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 2. Target Files / Auto-Discovery Banner (matching lavender banner in screenshot) */}
-      <div className="px-6 pt-1">
-        {selectedFiles.length > 0 ? (
-          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-50/70 border border-blue-200/70 text-xs text-blue-950 overflow-x-auto scrollbar-none">
-            <span className="flex items-center gap-1 font-semibold text-blue-700 flex-shrink-0">
-              <FileCheck2 size={14} />
-              Query Target ({selectedFiles.length}):
-            </span>
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {selectedFiles.map((sf) => (
-                <span
-                  key={sf.id}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white text-slate-700 text-[11px] font-medium border border-blue-200/60 shadow-2xs"
-                  title={sf.name}
-                >
-                  <span className="truncate max-w-[140px]">{sf.name}</span>
-                  {onDeselectFile && (
-                    <button
-                      type="button"
-                      onClick={() => onDeselectFile(sf.id)}
-                      className="text-slate-400 hover:text-rose-500 transition-colors ml-0.5"
+                return (
+                  <div key={step.key} className="flex items-center gap-2 flex-shrink-0">
+                    <div
+                      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all ${
+                        isActive
+                          ? "bg-blue-50/80 border border-blue-200 text-blue-700 font-semibold shadow-2xs"
+                          : isCompleted
+                          ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                          : "text-slate-400"
+                      }`}
                     >
-                      <X size={11} />
-                    </button>
-                  )}
+                      <span
+                        className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                          isActive
+                            ? "bg-blue-600 text-white"
+                            : isCompleted
+                            ? "bg-emerald-600 text-white"
+                            : "bg-slate-100 text-slate-500"
+                        }`}
+                      >
+                        {isCompleted ? "✓" : step.stepNum}
+                      </span>
+                      <span>{step.label}</span>
+                    </div>
+
+                    {idx < PIPELINE_STEPS.length - 1 && (
+                      <ChevronRight size={13} className="text-slate-300 flex-shrink-0" />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 2. Target Files / Auto-Discovery Banner */}
+          <div className="px-6 pt-1">
+            {selectedFiles.length > 0 ? (
+              <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-50/70 border border-blue-200/70 text-xs text-blue-950 overflow-x-auto scrollbar-none">
+                <span className="flex items-center gap-1 font-semibold text-blue-700 flex-shrink-0">
+                  <FileCheck2 size={14} />
+                  Query Target ({selectedFiles.length}):
                 </span>
-              ))}
-            </div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {selectedFiles.map((sf) => (
+                    <span
+                      key={sf.id}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white text-slate-700 text-[11px] font-medium border border-blue-200/60 shadow-2xs"
+                      title={sf.name}
+                    >
+                      <span className="truncate max-w-[140px]">{sf.name}</span>
+                      {onDeselectFile && (
+                        <button
+                          type="button"
+                          onClick={() => onDeselectFile(sf.id)}
+                          className="text-slate-400 hover:text-rose-500 transition-colors ml-0.5"
+                        >
+                          <X size={11} />
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="bg-purple-50/70 border border-purple-200/60 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Search size={14} className="text-purple-600 flex-shrink-0" />
+                  <span className="truncate text-slate-700">
+                    <strong className="text-purple-900 font-semibold">Smart Query Routing:</strong>{" "}
+                    Drive-related questions search relevant documents; general questions are answered directly.
+                  </span>
+                </div>
+                <span className="bg-purple-100 text-purple-700 font-semibold text-[10px] px-2.5 py-0.5 rounded-full flex-shrink-0">
+                  Smart Index Mode
+                </span>
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="bg-purple-50/70 border border-purple-200/60 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2 min-w-0">
-              <Search size={14} className="text-purple-600 flex-shrink-0" />
-              <span className="truncate text-slate-700">
-                <strong className="text-purple-900 font-semibold">Smart Query Routing:</strong>{" "}
-                Drive-related questions search relevant documents; general questions are answered directly.
-              </span>
-            </div>
-            <span className="bg-purple-100 text-purple-700 font-semibold text-[10px] px-2.5 py-0.5 rounded-full flex-shrink-0">
-              Smart Index Mode
-            </span>
-          </div>
-        )}
-      </div>
+        </>
+      )}
 
       {/* 3. Messages Stream */}
       <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-5 scrollbar-thin scrollbar-thumb-slate-200">
@@ -857,10 +1048,12 @@ export default function ChatInterface({
               <MessageSquare size={32} />
             </div>
             <h3 className="font-heading text-lg font-bold text-slate-800 mb-1.5">
-              No Active Chat Session
+              {isGeneralMode ? "General Knowledge Assistant" : "No Active Chat Session"}
             </h3>
             <p className="text-xs text-slate-500 max-w-sm mb-6 leading-relaxed">
-              Start a new conversation to ask questions about your documents, analyze spreadsheets, or chat with AI Drive Assistant.
+              {isGeneralMode
+                ? "Start a conversation to ask questions, solve programming problems, or explore concepts with AI Assistant."
+                : "Start a new conversation to ask questions about your documents, analyze spreadsheets, or chat with AI Drive Assistant."}
             </p>
             <button
               type="button"
@@ -913,8 +1106,8 @@ export default function ChatInterface({
 
                 {/* Bubble (clean white card with subtle border) */}
                 <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm p-4 text-xs text-slate-700 leading-relaxed shadow-xs">
-                  {/* Auto-discovered source files banner */}
-                  {msg.autoDiscovered && msg.candidateFiles?.length > 0 && (
+                  {/* Auto-discovered source files banner (Only in Drive Mode) */}
+                  {!isGeneralMode && msg.answerSource !== "guardrail_protection" && msg.autoDiscovered && msg.candidateFiles?.length > 0 && (
                     <div className="mb-2.5 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-50/70 border border-blue-200/60 text-xs text-blue-900">
                       <Search size={13} className="text-blue-600 flex-shrink-0" />
                       <span>
@@ -924,19 +1117,33 @@ export default function ChatInterface({
                   )}
 
                   {msg.answerSource && (
-                    <span className="mb-1 inline-flex w-fit rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
-                      {msg.answerSource === "google_drive"
-                        ? "Based on Google Drive documents"
-                        : msg.answerSource === "general_knowledge"
-                          ? "General knowledge — not from your documents"
-                          : msg.answerSource === "insufficient_drive_evidence"
-                            ? "No sufficient document evidence"
-                            : "Assistant information"}
-                    </span>
+                    <div className="mb-1">
+                      {isGeneralMode || msg.answerSource === "general_knowledge" ? (
+                        <span className="inline-flex w-fit rounded-full bg-indigo-50 border border-indigo-200/70 px-2.5 py-0.5 text-[10px] font-semibold text-indigo-700">
+                          Direct AI Response
+                        </span>
+                      ) : msg.answerSource === "guardrail_protection" ? (
+                        <span className="inline-flex w-fit rounded-full bg-amber-50 border border-amber-200/70 px-2.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                          Privacy Guardrail Protected
+                        </span>
+                      ) : msg.answerSource === "google_drive" ? (
+                        <span className="inline-flex w-fit rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                          Based on Google Drive documents
+                        </span>
+                      ) : msg.answerSource === "insufficient_drive_evidence" ? (
+                        <span className="inline-flex w-fit rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                          No sufficient document evidence
+                        </span>
+                      ) : (
+                        <span className="inline-flex w-fit rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                          Assistant information
+                        </span>
+                      )}
+                    </div>
                   )}
                   <MarkdownRenderer content={msg.text} />
 
-                  {msg.answerSource === "general_knowledge" && !msg.fromDriveSearch && msg.originalQuery && (
+                  {msg.answerSource === "general_knowledge" && !msg.fromDriveSearch && msg.originalQuery && !isGeneralMode && (
                     <div className="mt-2.5 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
                       <span>Answered from general knowledge.</span>
                       <button
@@ -1049,22 +1256,30 @@ export default function ChatInterface({
             <div className="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center flex-shrink-0 shadow-xs">
               <Sparkles size={14} className="animate-spin" />
             </div>
-            <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm px-4 py-2.5 text-xs text-slate-500 shadow-xs flex items-center gap-2">
-              <div className="w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-              <span>Checking files and preparing your answer...</span>
-              <button
-                type="button"
-                onClick={onCancelQuery}
-                className="ml-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-rose-600 hover:bg-rose-50 cursor-pointer"
-                title="Cancel the current query"
-              >
-                <Square size={10} fill="currentColor" />
-                Cancel
-              </button>
+            <div className="flex flex-col gap-1">
+              <div className="bg-white border border-slate-200/80 rounded-2xl rounded-tl-sm px-4 py-2.5 text-xs text-slate-600 shadow-xs flex items-center gap-2.5">
+                <div className="w-3.5 h-3.5 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                <span>
+                  {isGeneralMode
+                    ? "Generating answer..."
+                    : "Checking files and preparing your answer..."}
+                </span>
+                <button
+                  type="button"
+                  onClick={onCancelQuery}
+                  className="ml-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-rose-600 hover:bg-rose-50 cursor-pointer"
+                  title="Cancel the current query"
+                >
+                  <Square size={10} fill="currentColor" />
+                  Cancel
+                </button>
+              </div>
+              {!isGeneralMode && (
+                <p className="mt-0.5 ml-1 text-[10px] leading-relaxed text-slate-400">
+                  First-time checks and indexing can take longer. Safe files are indexed to speed up follow-up questions.
+                </p>
+              )}
             </div>
-            <p className="mt-1 ml-5 text-[10px] leading-relaxed text-slate-400">
-              First-time checks and indexing can take longer. Safe files are indexed to speed up follow-up questions.
-            </p>
           </div>
         )}
 
@@ -1095,7 +1310,9 @@ export default function ChatInterface({
             type="text"
             className="w-full bg-slate-50/80 border border-slate-200/90 rounded-2xl pl-9 pr-24 py-2.5 text-xs text-slate-800 placeholder-slate-400 outline-none transition-all focus:border-blue-500 focus:bg-white focus:ring-2 focus:ring-blue-100 font-sans"
             placeholder={
-              selectedFiles.length > 0
+              isGeneralMode
+                ? "Ask any question on programming, drafting, math, or concepts..."
+                : selectedFiles.length > 0
                 ? `Ask anything about ${selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} selected files`}...`
                 : "Ask a question — I'll answer generally or search relevant Drive files..."
             }
@@ -1119,27 +1336,162 @@ export default function ChatInterface({
           </div>
         </form>
 
-        {/* Suggestion Pills below input matching screenshot */}
-        <div className="flex items-center gap-1.5 mt-2.5 overflow-x-auto scrollbar-none text-xs">
-          <span className="text-[11px] text-slate-400 font-medium mr-0.5 flex-shrink-0">
-            Try asking:
-          </span>
-          {[
-            "Summarize my documents",
-            "Find important agreements",
-            "Analyze my files",
-          ].map((suggestion) => (
-            <button
-              key={suggestion}
-              type="button"
-              onClick={() => handleSuggestionClick(suggestion)}
-              className="text-[11px] text-slate-600 bg-white border border-slate-200/80 hover:border-slate-300 hover:bg-slate-50 px-2.5 py-0.5 rounded-full shadow-2xs transition-colors flex-shrink-0 cursor-pointer"
-            >
-              {suggestion}
-            </button>
-          ))}
-        </div>
+        {/* Suggestion Pills below input (Only in Google Drive Mode) */}
+        {!isGeneralMode && (
+          <div className="flex items-center gap-1.5 mt-2.5 overflow-x-auto scrollbar-none text-xs">
+            <span className="text-[11px] text-slate-400 font-medium mr-0.5 flex-shrink-0">
+              Try asking:
+            </span>
+            {[
+              "Summarize my documents",
+              "Find important agreements",
+              "Analyze my files",
+            ].map((suggestion) => (
+              <button
+                key={suggestion}
+                type="button"
+                onClick={() => handleSuggestionClick(suggestion)}
+                className="text-[11px] text-slate-600 bg-white border border-slate-200/80 hover:border-slate-300 hover:bg-slate-50 px-2.5 py-0.5 rounded-full shadow-2xs transition-colors flex-shrink-0 cursor-pointer"
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
+
+      {/* ── Import Session Modal (Cross-Mode & External File Import) ── */}
+      {isImportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs animate-fade-in">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full overflow-hidden flex flex-col max-h-[85vh] animate-scale-in">
+            {/* Modal Header */}
+            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/70">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-200/80 flex items-center justify-center text-indigo-600 shadow-2xs">
+                  <ArrowDownToLine size={16} />
+                </div>
+                <div>
+                  <h3 className="text-xs font-bold text-slate-900 font-heading">
+                    Import Chat Session
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Import to {isGeneralMode ? "General Questions" : "Google Drive"} Mode
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsImportModalOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4">
+              {importSuccessMsg ? (
+                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-emerald-600 flex-shrink-0" />
+                  <span>{importSuccessMsg}</span>
+                </div>
+              ) : null}
+
+              <div className="text-[11px] text-slate-600 bg-blue-50/60 border border-blue-200/70 rounded-xl p-3 leading-relaxed">
+                {isGeneralMode ? (
+                  <>
+                    Available sessions from your <strong>Google Drive Mode</strong>. Importing creates a copy in General Questions mode so you can continue exploring concepts or coding.
+                  </>
+                ) : (
+                  <>
+                    Available sessions from your <strong>General Questions Mode</strong>. Importing creates a copy in Google Drive mode so you can ground the conversation against your Drive documents.
+                  </>
+                )}
+              </div>
+
+              {/* Sessions List from other mode */}
+              <div>
+                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-2">
+                  {isGeneralMode ? "Google Drive Mode Sessions" : "General Questions Sessions"}
+                </span>
+
+                {isLoadingOtherSessions ? (
+                  <div className="py-8 flex flex-col items-center justify-center gap-2 text-xs text-slate-400">
+                    <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                    <span>Loading sessions...</span>
+                  </div>
+                ) : otherModeSessions.length === 0 ? (
+                  <div className="py-6 px-4 text-center rounded-xl bg-slate-50 border border-dashed border-slate-200 text-xs text-slate-400">
+                    No sessions found in {isGeneralMode ? "Google Drive" : "General Questions"} mode yet.
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                    {otherModeSessions.map((os) => (
+                      <div
+                        key={os.id}
+                        className="p-3 rounded-xl border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/30 transition-all flex items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-slate-800 truncate">
+                            {os.title || "Untitled Chat"}
+                          </p>
+                          <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-400">
+                            <span>{os.message_count} messages</span>
+                            <span>•</span>
+                            <span>
+                              {os.updated_at
+                                ? new Date(os.updated_at).toLocaleDateString([], {
+                                    month: "short",
+                                    day: "numeric",
+                                  })
+                                : "Recent"}
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={importingSessionId === os.id}
+                          onClick={() => handleImportSession(os.id)}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer shadow-2xs"
+                        >
+                          {importingSessionId === os.id ? (
+                            <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            <ArrowDownToLine size={12} />
+                          )}
+                          <span>Import</span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Alternative: JSON file upload */}
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-3">
+                <span className="text-[11px] text-slate-500">
+                  Or import from exported file:
+                </span>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  accept=".json"
+                  onChange={handleImportJsonFile}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-700 text-[11px] font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Upload size={12} className="text-slate-500" />
+                  <span>Choose JSON</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

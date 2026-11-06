@@ -31,7 +31,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 DOCUMENT_EXTRACTION_VERSION = 7
 # PDF OCR configuration – tuned for speed while keeping accuracy.
-PDF_OCR_PAGE_LIMIT = int(os.getenv("PDF_OCR_PAGE_LIMIT", "20"))   # default 20 pages
+PDF_OCR_PAGE_LIMIT = int(os.getenv("PDF_OCR_PAGE_LIMIT", "50"))   # default 50 pages
 # Fast OCR mode: if FAST_OCR env var true, lower DPI and page limit for speed
 FAST_OCR = os.getenv("FAST_OCR", "false").lower() == "true"
 if FAST_OCR:
@@ -39,7 +39,7 @@ if FAST_OCR:
     PDF_OCR_PAGE_LIMIT = 5  # fewer pages OCRed
     logger.info("Fast OCR mode enabled: DPI=%s, page_limit=%s", PDF_OCR_DPI, PDF_OCR_PAGE_LIMIT)
 PDF_IMAGE_COVERAGE_THRESHOLD = 0.35
-PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "120"))               # default 120 DPI
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "200"))               # default 200 DPI
 
 if settings.TESSERACT_CMD:
     configured_tesseract = shutil.which(settings.TESSERACT_CMD)
@@ -75,9 +75,10 @@ def _ocr_pdf_page(page, allow_vision_fallback: bool = True) -> str:
     pixmap = page.get_pixmap(dpi=PDF_OCR_DPI, alpha=False)
     image_bytes = pixmap.tobytes("png")
     text = _ocr_image_with_tesseract(image_bytes)
-    if len(text.split()) >= 8:
-        return text
-    if allow_vision_fallback:
+    # Run OCR on the page image.
+    # If the initial Tesseract extraction yields very little text (<= 8 words),
+    # attempt a higher‑quality Gemini Vision OCR fallback.
+    if len(text.split()) <= 8 and allow_vision_fallback:
         return ocr_image_with_gemini_vision(image_bytes, mime_type="image/png")
     return text
 

@@ -87,7 +87,7 @@ async def coalesce_query(key: str) -> AsyncGenerator[None, None]:
 
 
 def _cache_kinds(intent: str, allow_general_answer: bool) -> List[str]:
-    if intent in {"capabilities", "assistant_info", "media"}:
+    if intent in {"capabilities", "assistant_info", "media", "confidential"}:
         return ["assistant"]
     if allow_general_answer or intent == "direct_answer":
         return ["general"]
@@ -155,6 +155,7 @@ async def lookup_cached_answer(
     selected_file_ids: Optional[List[str]] = None,
     *,
     allow_general_answer: bool = False,
+    mode: Optional[str] = None,
 ) -> Optional[QueryAnswerCache]:
     """Return a complete, safe exact-normalized-query cache entry, if valid."""
     now = datetime.now(timezone.utc)
@@ -163,7 +164,7 @@ async def lookup_cached_answer(
     try:
         # Match by (user_id, query_hash, scope_hash) so that repeated identical queries
         # always return identical cached results regardless of transient initial_intent classification.
-        result = await db.execute(
+        stmt = (
             select(QueryAnswerCache)
             .where(
                 QueryAnswerCache.user_id == user_id,
@@ -173,12 +174,20 @@ async def lookup_cached_answer(
                 QueryAnswerCache.is_safe.is_(True),
                 QueryAnswerCache.expires_at > now,
             )
-            .order_by(
+        )
+        if mode == "general":
+            if intent == "confidential":
+                stmt = stmt.where(QueryAnswerCache.answer_kind == "assistant")
+            else:
+                stmt = stmt.where(QueryAnswerCache.answer_kind == "general")
+            stmt = stmt.order_by(QueryAnswerCache.created_at.desc())
+        else:
+            stmt = stmt.order_by(
                 # Prefer grounded document answers first, then assistant/general
                 (QueryAnswerCache.answer_kind == "document").desc(),
                 QueryAnswerCache.created_at.desc(),
             )
-        )
+        result = await db.execute(stmt)
     except Exception as exc:
         logger.exception("Failed to query persistent answer cache.")
         raise QueryCacheUnavailableError(
@@ -186,13 +195,18 @@ async def lookup_cached_answer(
         ) from exc
 
     entries = result.scalars().all()
-    allowed_kinds = set(_cache_kinds(intent, allow_general_answer))
-    # If general answers are allowed or intent is direct_answer, add general
-    if allow_general_answer or intent == "direct_answer":
-        allowed_kinds.add("general")
-    # Document and assistant answers are always valid cached results for identical queries
-    allowed_kinds.add("document")
-    allowed_kinds.add("assistant")
+    if intent == "confidential":
+        allowed_kinds = {"assistant"}
+    elif mode == "general":
+        allowed_kinds = {"general"}
+    else:
+        allowed_kinds = set(_cache_kinds(intent, allow_general_answer))
+        # If general answers are allowed or intent is direct_answer, add general
+        if allow_general_answer or intent == "direct_answer":
+            allowed_kinds.add("general")
+        # Document and assistant answers are always valid cached results for identical queries
+        allowed_kinds.add("document")
+        allowed_kinds.add("assistant")
 
     for entry in entries:
         if entry.answer_kind not in allowed_kinds:

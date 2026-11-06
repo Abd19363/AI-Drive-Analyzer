@@ -9,7 +9,7 @@ import AuditLogsModal from "./components/AuditLogsModal";
 import AdminPortal from "./components/AdminPortal";
 import UserPortalAuth from "./components/UserPortalAuth";
 import LandingPage from "./components/LandingPage";
-import { AlertCircle, CheckCircle2, X, AlertTriangle, LogOut, RefreshCw } from "lucide-react";
+import { AlertCircle, CheckCircle2, X, AlertTriangle, LogOut, RefreshCw, HardDrive, Zap, Sparkles, ArrowRight, ShieldCheck } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
@@ -47,6 +47,7 @@ export default function Home() {
   const [driveError, setDriveError] = useState(null);
   const [isDisconnectRequiredModalOpen, setIsDisconnectRequiredModalOpen] = useState(false);
   const [isDisconnectingBeforeLogout, setIsDisconnectingBeforeLogout] = useState(false);
+  const [assistantMode, setAssistantMode] = useState(null); // null (shows mode selection screen) | "drive" | "general"
   const activeQueryRef = useRef(null);
 
   useEffect(() => {
@@ -61,6 +62,8 @@ export default function Home() {
       const connectedParam = params.get("connected");
       if (connectedParam === "true") {
         setShowLanding(false);
+        setAssistantMode("drive");
+        sessionStorage.setItem("ai_drive_assistant_mode", "drive");
       }
       const errorParam = params.get("error");
 
@@ -106,6 +109,10 @@ export default function Home() {
           setIsConnected(false);
           setGoogleEmail("");
         }
+        const savedMode = sessionStorage.getItem("ai_drive_assistant_mode");
+        if (savedMode) {
+          setAssistantMode(savedMode);
+        }
       } else {
         // User record was removed or invalid; reset to sign-in state
         sessionStorage.removeItem("ai_drive_user_id");
@@ -133,11 +140,15 @@ export default function Home() {
       fetchDriveFiles(data.user_id);
     } else {
       setIsConnected(false);
+      setAssistantMode(null);
+      sessionStorage.removeItem("ai_drive_assistant_mode");
       setGoogleEmail("");
     }
+    setAssistantMode(null);
+    sessionStorage.removeItem("ai_drive_assistant_mode");
     setNotification({
       type: "success",
-      message: `Welcome, ${data.full_name || data.email}! Please connect a Google Drive account of your choice.`,
+      message: `Welcome, ${data.full_name || data.email}! Please select an assistant mode below.`,
     });
   };
 
@@ -163,6 +174,8 @@ export default function Home() {
     setPortalEmail("");
     setGoogleEmail("");
     setIsConnected(false);
+    setAssistantMode(null);
+    sessionStorage.removeItem("ai_drive_assistant_mode");
     setDriveFiles([]);
     setSelectedFileIds([]);
     setNotification({
@@ -180,6 +193,8 @@ export default function Home() {
         });
       }
       setIsConnected(false);
+      setAssistantMode(null);
+      sessionStorage.removeItem("ai_drive_assistant_mode");
       setGoogleEmail("");
       setDriveFiles([]);
       setSelectedFileIds([]);
@@ -404,8 +419,9 @@ export default function Home() {
     sessionId = null
   ) => {
     if (!userId) throw new Error("Please sign in to the User Portal first.");
+    const isGeneral = allowGeneralAnswer || assistantMode === "general";
     setIsProcessingQuery(true);
-    setCurrentStep("ANALYZING");
+    setCurrentStep(isGeneral ? "ANSWERING" : "ANALYZING");
     const queryId = requestedQueryId || crypto.randomUUID();
     const controller = new AbortController();
     activeQueryRef.current = { queryId, controller };
@@ -418,10 +434,11 @@ export default function Home() {
           session_id: sessionId,
           query_id: queryId,
           query: queryText,
-          selected_file_ids: fileIds,
-          matched_file_ids: matchedFileIds,
-          allow_general_answer: allowGeneralAnswer,
-          force_drive_search: forceDriveSearch,
+          selected_file_ids: isGeneral ? [] : fileIds,
+          matched_file_ids: isGeneral ? [] : matchedFileIds,
+          allow_general_answer: isGeneral,
+          force_drive_search: isGeneral ? false : forceDriveSearch,
+          mode: isGeneral ? "general" : "drive",
         }),
         signal: controller.signal,
       });
@@ -430,8 +447,8 @@ export default function Home() {
         throw new Error(e.detail || `Server error ${res.status}`);
       }
       const data = await res.json();
-      // Refresh file list in background — must NOT block the return value
-      if (data.analysis_required !== false) {
+      // Refresh file list in background — only for drive mode
+      if (!isGeneral && data.analysis_required !== false) {
         fetchDriveFiles(userId).catch(console.error);
       }
       return { ...data, query_id: queryId };
@@ -569,53 +586,312 @@ export default function Home() {
                 </div>
               )}
 
-              {/* Main Container */}
-              <div className="max-w-[1440px] mx-auto px-6 py-5 flex flex-col gap-5">
-                {/* Full-width Connect Google Drive Banner (matching screenshot) */}
-                <DriveConnector
-                  isConnected={isConnected}
-                  portalEmail={portalEmail}
-                  googleEmail={googleEmail}
-                  onConnect={handleConnectDrive}
-                  onDisconnect={handleDisconnectDrive}
-                  onReloadFiles={handleReloadFiles}
-                  isLoading={isConnecting}
-                  isDisconnecting={isDisconnecting}
-                  isReloading={isReloadingFiles}
-                />
+              {/* ──────────────── ASSISTANT INQUIRY MODE SELECTION OR WORKSPACE ──────────────── */}
+              {assistantMode === null ? (
+                /* 1. Mode Selection Screen (Shown upon signing in instead of chatbot) */
+                <div className="max-w-4xl mx-auto px-6 py-12 flex flex-col items-center animate-fade-in text-center my-auto">
+                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-blue-50 border border-blue-200/90 text-xs text-blue-700 font-bold mb-4 shadow-2xs">
+                    <Sparkles size={14} className="text-blue-600" />
+                    <span>Choose Your Inquiry Mode</span>
+                  </div>
 
-                {/* 2-Column Grid: Drive Catalog (left) & Chat Workspace (right) */}
-                <div className="grid grid-cols-1 lg:grid-cols-[330px_1fr] gap-5 items-start">
-                  <FileList
-                    files={driveFiles}
-                    isLoading={isLoadingFiles}
-                    isReloading={isReloadingFiles}
-                    driveError={driveError}
-                    isConnected={isConnected}
-                    onReconnect={handleConnectDrive}
-                    onReloadFiles={handleReloadFiles}
-                    onFetchFolderChildren={handleFetchFolderChildren}
-                    selectedFileIds={selectedFileIds}
-                    onToggleSelectFile={handleToggleSelectFile}
-                    onSelectAll={handleSelectAll}
-                    onClearSelection={handleClearSelection}
-                  />
+                  <h2 className="font-heading text-2xl sm:text-3xl font-extrabold text-slate-900 mb-3 tracking-tight">
+                    How would you like to assist you today?
+                  </h2>
+                  <p className="text-slate-600 text-xs sm:text-sm max-w-xl mx-auto mb-10 leading-relaxed font-normal">
+                    Select an inquiry mode below to begin. You can seamlessly switch between your Google Drive files and general questions at any time.
+                  </p>
 
-                  <ChatInterface
-                    userId={userId}
-                    portalEmail={portalEmail}
-                    onAskQuestion={handleAskQuestion}
-                    onResponseDisplayed={handleResponseDisplayed}
-                    onCancelQuery={handleCancelQuery}
-                    onRecordFallbackDecision={handleRecordFallbackDecision}
-                    isProcessing={isProcessingQuery}
-                    currentStep={currentStep}
-                    selectedFiles={selectedFilesList}
-                    selectedFileIds={selectedFileIds}
-                    onDeselectFile={handleDeselectFile}
-                  />
+                  {/* Two Main Option Cards */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full text-left">
+                    {/* Option 1: Google Drive Knowledge Base */}
+                    <div
+                      onClick={() => {
+                        setAssistantMode("drive");
+                        sessionStorage.setItem("ai_drive_assistant_mode", "drive");
+                      }}
+                      className="group relative p-7 rounded-3xl bg-white border border-slate-200/90 shadow-md hover:shadow-xl hover:border-blue-400 transition-all cursor-pointer flex flex-col justify-between"
+                    >
+                      <div>
+                        <div className="flex items-center justify-between mb-5">
+                          <div className="w-12 h-12 rounded-2xl bg-blue-50 group-hover:bg-blue-600 text-blue-600 group-hover:text-white border border-blue-100 flex items-center justify-center transition-colors shadow-2xs">
+                            <HardDrive size={22} />
+                          </div>
+                          <span className="text-[10px] font-bold text-blue-700 bg-blue-50 px-2.5 py-1 rounded-full border border-blue-200">
+                            Document Grounded
+                          </span>
+                        </div>
+
+                        <h3 className="font-heading text-lg font-bold text-slate-900 group-hover:text-blue-600 transition-colors mb-2">
+                          Query Google Drive Documents
+                        </h3>
+                        <p className="text-xs text-slate-600 leading-relaxed mb-6">
+                          Search through your private Drive files, analyze complex spreadsheets, and retrieve cited answers with built-in zero-knowledge privacy.
+                        </p>
+
+                        <div className="space-y-2 text-xs text-slate-600 border-t border-slate-100 pt-4 mb-6">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>Instant PDF, Sheet & Doc catalog navigation</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>Exact page & table source citations</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>Multi-layer zero-knowledge privacy filter</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="w-full inline-flex items-center justify-center gap-2 py-3 rounded-xl bg-blue-600 group-hover:bg-blue-700 text-white font-bold text-xs shadow-md shadow-blue-500/20 transition-all cursor-pointer"
+                      >
+                        <span>{isConnected ? "Open Drive Knowledge Base" : "Connect Google Drive & Query"}</span>
+                        <ArrowRight size={14} className="group-hover:translate-x-0.5 transition-transform" />
+                      </button>
+                    </div>
+
+                    {/* Option 2: General Knowledge Questions */}
+                    <div
+                      onClick={() => {
+                        setAssistantMode("general");
+                        sessionStorage.setItem("ai_drive_assistant_mode", "general");
+                      }}
+                      className="group relative p-7 rounded-3xl bg-white border border-slate-200/90 shadow-md hover:shadow-xl hover:border-indigo-400 transition-all cursor-pointer flex flex-col justify-between"
+                    >
+                      <div>
+                        <div className="flex items-center justify-between mb-5">
+                          <div className="w-12 h-12 rounded-2xl bg-indigo-50 group-hover:bg-indigo-600 text-indigo-600 group-hover:text-white border border-indigo-100 flex items-center justify-center transition-colors shadow-2xs">
+                            <Zap size={22} />
+                          </div>
+                          <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-full border border-indigo-200">
+                            Zero Setup Required
+                          </span>
+                        </div>
+
+                        <h3 className="font-heading text-lg font-bold text-slate-900 group-hover:text-indigo-600 transition-colors mb-2">
+                          Ask General Questions
+                        </h3>
+                        <p className="text-xs text-slate-600 leading-relaxed mb-6">
+                          Get immediate answers for programming guidance, document drafting, mathematics, research, and general problem-solving without connecting Google Drive.
+                        </p>
+
+                        <div className="space-y-2 text-xs text-slate-600 border-t border-slate-100 pt-4 mb-6">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>Instant reasoning powered by Gemini 2.5 Flash</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>No Google Drive connection required</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                            <span>Interactive multi-session chat with auto-titling</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="w-full inline-flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-600 group-hover:bg-indigo-700 text-white font-bold text-xs shadow-md shadow-indigo-500/20 transition-all cursor-pointer"
+                      >
+                        <span>Start General Chat</span>
+                        <ArrowRight size={14} className="group-hover:translate-x-0.5 transition-transform" />
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                /* 2. Main Assistant Workspace (Drive Mode or General Mode) */
+                <div className="max-w-[1440px] mx-auto px-6 py-4 flex flex-col gap-4 animate-fade-in">
+                  {/* Mode Navigation Bar */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-2xl bg-white border border-slate-200/90 shadow-2xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold text-slate-400">Current Mode:</span>
+                      <span
+                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-bold ${
+                          assistantMode === "drive"
+                            ? "bg-blue-50 text-blue-700 border border-blue-200"
+                            : "bg-indigo-50 text-indigo-700 border border-indigo-200"
+                        }`}
+                      >
+                        {assistantMode === "drive" ? (
+                          <>
+                            <HardDrive size={13} />
+                            <span>Google Drive Knowledge Base</span>
+                          </>
+                        ) : (
+                          <>
+                            <Zap size={13} />
+                            <span>General Knowledge Assistant</span>
+                          </>
+                        )}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nextMode = assistantMode === "drive" ? "general" : "drive";
+                          setAssistantMode(nextMode);
+                          sessionStorage.setItem("ai_drive_assistant_mode", nextMode);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200/80 transition-all cursor-pointer"
+                      >
+                        <RefreshCw size={12} className="text-slate-500" />
+                        <span>
+                          Switch to {assistantMode === "drive" ? "General Questions" : "Google Drive"}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAssistantMode(null);
+                          sessionStorage.removeItem("ai_drive_assistant_mode");
+                        }}
+                        className="px-2.5 py-1.5 rounded-xl text-xs font-medium text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                        title="Return to mode selection screen"
+                      >
+                        Change Mode
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* ── Mode 1: Google Drive Knowledge Base ── */}
+                  {assistantMode === "drive" && (
+                    <>
+                      {/* If NOT connected: Show the clean Connect Google Drive view */}
+                      {!isConnected ? (
+                        <div className="max-w-2xl mx-auto py-12 px-6 text-center animate-fade-in bg-white rounded-3xl border border-slate-200/90 shadow-xl my-4">
+                          <div className="w-16 h-16 rounded-2xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 mx-auto mb-4 shadow-sm">
+                            <HardDrive size={30} />
+                          </div>
+                          <span className="inline-flex items-center gap-1 text-[11px] font-bold text-blue-700 bg-blue-50 px-3 py-0.5 rounded-full border border-blue-200 mb-3">
+                            Google Drive Authorization Required
+                          </span>
+                          <h2 className="font-heading text-2xl font-bold text-slate-900 mb-2">
+                            Connect Your Google Drive
+                          </h2>
+                          <p className="text-slate-600 text-xs sm:text-sm max-w-md mx-auto mb-8 leading-relaxed">
+                            Authorize read-only access to your Google Drive to index documents, analyze financial spreadsheets, and chat with exact source citations.
+                          </p>
+
+                          <div className="flex flex-col sm:flex-row items-center justify-center gap-3.5 mb-6">
+                            <button
+                              type="button"
+                              onClick={handleConnectDrive}
+                              disabled={isConnecting}
+                              className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-8 py-3.5 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-lg shadow-blue-500/25 transition-all cursor-pointer disabled:opacity-50"
+                            >
+                              {isConnecting ? (
+                                <>
+                                  <RefreshCw size={14} className="animate-spin" />
+                                  <span>Connecting to Google...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <HardDrive size={15} />
+                                  <span>Connect Google Drive</span>
+                                  <ArrowRight size={14} />
+                                </>
+                              )}
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setAssistantMode("general");
+                                sessionStorage.setItem("ai_drive_assistant_mode", "general");
+                              }}
+                              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-3.5 rounded-2xl bg-slate-50 hover:bg-slate-100 text-slate-700 font-semibold text-xs border border-slate-200 transition-all cursor-pointer"
+                            >
+                              <Zap size={14} className="text-indigo-600" />
+                              <span>Ask General Questions Instead</span>
+                            </button>
+                          </div>
+
+                          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-50 border border-slate-200/80 text-[11px] text-slate-500">
+                            <ShieldCheck size={14} className="text-emerald-600" />
+                            <span>Read-only permissions • Multi-layer zero-knowledge PII redaction</span>
+                          </div>
+                        </div>
+                      ) : (
+                        /* If Connected: Show Drive connector banner + 2-Column Catalog & Chat */
+                        <>
+                          <DriveConnector
+                            isConnected={isConnected}
+                            portalEmail={portalEmail}
+                            googleEmail={googleEmail}
+                            onConnect={handleConnectDrive}
+                            onDisconnect={handleDisconnectDrive}
+                            onReloadFiles={handleReloadFiles}
+                            isLoading={isConnecting}
+                            isDisconnecting={isDisconnecting}
+                            isReloading={isReloadingFiles}
+                          />
+
+                          <div className="grid grid-cols-1 lg:grid-cols-[330px_1fr] gap-5 items-start">
+                            <FileList
+                              files={driveFiles}
+                              isLoading={isLoadingFiles}
+                              isReloading={isReloadingFiles}
+                              driveError={driveError}
+                              isConnected={isConnected}
+                              onReconnect={handleConnectDrive}
+                              onReloadFiles={handleReloadFiles}
+                              onFetchFolderChildren={handleFetchFolderChildren}
+                              selectedFileIds={selectedFileIds}
+                              onToggleSelectFile={handleToggleSelectFile}
+                              onSelectAll={handleSelectAll}
+                              onClearSelection={handleClearSelection}
+                            />
+
+                            <ChatInterface
+                              userId={userId}
+                              portalEmail={portalEmail}
+                              onAskQuestion={handleAskQuestion}
+                              onResponseDisplayed={handleResponseDisplayed}
+                              onCancelQuery={handleCancelQuery}
+                              onRecordFallbackDecision={handleRecordFallbackDecision}
+                              isProcessing={isProcessingQuery}
+                              currentStep={currentStep}
+                              selectedFiles={selectedFilesList}
+                              selectedFileIds={selectedFileIds}
+                              onDeselectFile={handleDeselectFile}
+                              isGeneralMode={false}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </>
+                  )}
+
+                  {/* ── Mode 2: General Knowledge Questions ── */}
+                  {assistantMode === "general" && (
+                    <div className="max-w-5xl mx-auto w-full animate-fade-in">
+                      <ChatInterface
+                        userId={userId}
+                        portalEmail={portalEmail}
+                        onAskQuestion={handleAskQuestion}
+                        onResponseDisplayed={handleResponseDisplayed}
+                        onCancelQuery={handleCancelQuery}
+                        onRecordFallbackDecision={handleRecordFallbackDecision}
+                        isProcessing={isProcessingQuery}
+                        currentStep={currentStep}
+                        selectedFiles={[]}
+                        selectedFileIds={[]}
+                        onDeselectFile={() => {}}
+                        isGeneralMode={true}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
 

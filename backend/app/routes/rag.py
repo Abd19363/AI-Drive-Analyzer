@@ -39,7 +39,11 @@ from app.services.query_intent_service import (
     _BUSINESS_DATA_PATTERN,
     _EXPLICIT_GENERAL_PATTERN,
 )
-from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE
+from app.services.guardrail_service import (
+    is_query_about_media,
+    MEDIA_QUERY_RESPONSE,
+    check_confidential_query,
+)
 from app.services.query_cache_service import (
     QueryCacheUnavailableError,
     cache_lock_key,
@@ -63,12 +67,26 @@ class QuestionRequest(BaseModel):
     matched_file_ids: Optional[List[str]] = None
     force_drive_search: bool = False
     intent: Optional[QueryIntent] = None
+    mode: Optional[str] = None
 
 
 class CreateSessionRequest(BaseModel):
     user_id: str
+    mode: Optional[str] = "drive"
     title: Optional[str] = "New Chat"
     messages: Optional[List[Dict[str, Any]]] = None
+
+
+class ImportSessionRequest(BaseModel):
+    user_id: str
+    target_mode: str = "drive"
+
+
+class ImportExternalSessionRequest(BaseModel):
+    user_id: str
+    mode: str = "drive"
+    title: Optional[str] = None
+    messages: List[Dict[str, Any]] = []
 
 
 class GenerateTitleRequest(BaseModel):
@@ -119,6 +137,8 @@ def _classify_request_intent(
     selected_file_ids: List[str],
     matched_file_ids: Optional[List[str]] = None,
 ) -> QueryIntent:
+    if check_confidential_query(query):
+        return "confidential"
     intent = classify_query_intent(
         query,
         has_selected_files=bool(selected_file_ids or matched_file_ids),
@@ -131,7 +151,7 @@ def _classify_request_intent(
 
 
 def _requires_document_analysis(intent: QueryIntent) -> bool:
-    return intent not in {"capabilities", "assistant_info", "direct_answer", "media", "drive_inventory"}
+    return intent not in {"capabilities", "assistant_info", "direct_answer", "media", "drive_inventory", "confidential"}
 
 
 async def _resolve_query_route(
@@ -147,6 +167,8 @@ async def _resolve_query_route(
         selected_file_ids,
         matched_file_ids,
     )
+    if intent == "confidential":
+        return intent, []
 
     if not selected_file_ids and not matched_file_ids:
         matched_file_ids = await _find_drive_name_matches(db, query, user_id)
@@ -514,6 +536,7 @@ async def _lookup_answer_cache(
     selected_file_ids: Optional[List[str]],
     *,
     allow_general_answer: bool = False,
+    mode: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     try:
         entry = await lookup_cached_answer(
@@ -523,6 +546,7 @@ async def _lookup_answer_cache(
             intent,
             selected_file_ids,
             allow_general_answer=allow_general_answer,
+            mode=mode,
         )
     except QueryCacheUnavailableError as exc:
         raise HTTPException(
@@ -784,9 +808,45 @@ async def _ask_question_impl(
             pass
 
     started_at = time.perf_counter()
-    selected_file_ids = payload.selected_file_ids or []
-    matched_file_ids = payload.matched_file_ids or []
-    if payload.intent is None:
+    is_general_mode = (payload.mode == "general") or bool(payload.allow_general_answer)
+    if is_general_mode:
+        selected_file_ids = []
+        matched_file_ids = []
+        payload.selected_file_ids = []
+        payload.matched_file_ids = []
+        payload.force_drive_search = False
+        payload.allow_general_answer = True
+    else:
+        selected_file_ids = payload.selected_file_ids or []
+        matched_file_ids = payload.matched_file_ids or []
+
+    effective_mode = "general" if is_general_mode else payload.mode
+
+    if is_general_mode:
+        initial_intent = "confidential" if check_confidential_query(query) else "general"
+        cached_response = await _lookup_answer_cache(
+            db,
+            payload.user_id,
+            query,
+            initial_intent,
+            selected_file_ids,
+            allow_general_answer=payload.allow_general_answer,
+            mode=effective_mode,
+        )
+        if cached_response:
+            latency_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                "[RAG] /ask early cache hit (general mode) returned in %.3fs",
+                time.perf_counter() - started_at,
+            )
+            await _record_telemetry(
+                db, payload.user_id, latency_ms, cache_hit=True, api_called=False,
+                intent=initial_intent, prompt_tokens=0, completion_tokens=0,
+                query_id=payload.query_id
+            )
+            return cached_response
+        intent = initial_intent
+    elif payload.intent is None:
         initial_intent = _classify_request_intent(
             query,
             selected_file_ids,
@@ -799,6 +859,7 @@ async def _ask_question_impl(
             initial_intent,
             selected_file_ids,
             allow_general_answer=payload.allow_general_answer,
+            mode=effective_mode,
         )
         if cached_response:
             latency_ms = (time.perf_counter() - started_at) * 1000
@@ -833,6 +894,7 @@ async def _ask_question_impl(
                     intent,
                     selected_file_ids,
                     allow_general_answer=payload.allow_general_answer,
+                    mode=effective_mode,
                 )
                 if cached_response:
                     latency_ms = (time.perf_counter() - started_at) * 1000
@@ -855,6 +917,7 @@ async def _ask_question_impl(
             intent,
             selected_file_ids,
             allow_general_answer=payload.allow_general_answer,
+            mode=effective_mode,
         )
         if cached_response:
             latency_ms = (time.perf_counter() - started_at) * 1000
@@ -868,7 +931,8 @@ async def _ask_question_impl(
             )
             return cached_response
         if (
-            not payload.allow_general_answer
+            not is_general_mode
+            and not payload.allow_general_answer
             and not selected_file_ids
             and not matched_file_ids
         ):
@@ -886,7 +950,7 @@ async def _ask_question_impl(
                     "media",
                 }:
                     intent = "fact"
-        if payload.force_drive_search and intent in {
+        if not is_general_mode and payload.force_drive_search and intent in {
             "capabilities",
             "assistant_info",
             "direct_answer",
@@ -908,6 +972,7 @@ async def _ask_question_impl(
             intent,
             selected_file_ids,
             allow_general_answer=payload.allow_general_answer,
+            mode=effective_mode,
         )
         if cached_response:
             latency_ms = (time.perf_counter() - started_at) * 1000
@@ -970,33 +1035,73 @@ async def _ask_question_uncached(
 
     matched_file_ids = payload.matched_file_ids or []
     retrieval_file_ids = selected_file_ids or matched_file_ids
+
+    # 1. Check confidential guardrails first
+    if intent == "confidential" or check_confidential_query(query):
+        conf_match = check_confidential_query(query)
+        answer = conf_match[1] if conf_match else "This is private and confidential information. Transaction amounts, payment receipts, and financial transaction details are protected by our privacy and security guardrails and cannot be disclosed."
+        return _answer_response(
+            query,
+            "confidential",
+            answer,
+            analysis_required=False,
+            answer_source="guardrail_protection",
+            matched_file_ids=[],
+            candidate_files=[],
+            auto_discovered=False,
+        )
+
+    is_general_mode = (payload.mode == "general") or bool(payload.allow_general_answer)
+    # 2. General Questions Mode: Generate rich, detailed conversational AI response
+    if is_general_mode:
+        history = []
+        if payload.session_id:
+            try:
+                sess_stmt = select(ChatSession).where(
+                    ChatSession.id == payload.session_id,
+                    ChatSession.user_id == payload.user_id,
+                    ChatSession.is_deleted.is_(False),
+                )
+                sess_res = await db.execute(sess_stmt)
+                current_sess = sess_res.scalar_one_or_none()
+                if current_sess and current_sess.messages:
+                    for m in current_sess.messages[-6:]:
+                        sender = m.get("sender")
+                        text = m.get("text")
+                        if sender and text:
+                            role = "user" if sender == "user" else "model"
+                            history.append({"role": role, "text": text})
+            except Exception as e:
+                logger.warning(f"Failed to load session history for general query: {e}")
+
+        try:
+            answer = await answer_general_query(query, conversation_history=history)
+        except GeminiServiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        await _save_answer(
+            db, user_id, query, answer, "general", "general",
+            selected_file_ids=[],
+        )
+        await store_user_decision(
+            db, user_id, query, "general", "accepted", []
+        )
+        return _answer_response(
+            query,
+            "general",
+            answer,
+            analysis_required=False,
+            answer_source="general_knowledge",
+            matched_file_ids=[],
+            candidate_files=[],
+            auto_discovered=False,
+        )
+
     if intent is None:
         intent = _classify_request_intent(
             query,
             selected_file_ids,
             matched_file_ids,
-        )
-    if payload.allow_general_answer and intent not in {
-        "capabilities", "assistant_info", "media"
-    }:
-        try:
-            answer = await answer_general_query(query)
-        except GeminiServiceUnavailableError as e:
-            raise HTTPException(status_code=503, detail=str(e)) from e
-        await _save_answer(
-            db, user_id, query, answer, intent, "general",
-            selected_file_ids=selected_file_ids,
-        )
-        await store_user_decision(
-            db, user_id, query, intent, "accepted", selected_file_ids
-        )
-        return _answer_response(
-            query,
-            intent,
-            answer,
-            analysis_required=False,
-            answer_source="general_knowledge",
-            matched_file_ids=matched_file_ids,
         )
 
     if intent == "capabilities":
@@ -1036,7 +1141,10 @@ async def _ask_question_uncached(
             intent,
             answer,
             analysis_required=False,
-            answer_source="assistant",
+            answer_source="guardrail_protection" if intent == "confidential" else "assistant",
+            matched_file_ids=[],
+            candidate_files=[],
+            auto_discovered=False,
         )
 
     if intent == "drive_inventory":
@@ -1632,13 +1740,19 @@ async def get_query_history(user_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/sessions")
-async def list_chat_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
-    """List all active (non-deleted) chat sessions for a user."""
+async def list_chat_sessions(
+    user_id: str,
+    mode: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all active (non-deleted) chat sessions for a user, optionally filtered by mode."""
     stmt = (
         select(ChatSession)
         .where(ChatSession.user_id == user_id, ChatSession.is_deleted.is_(False))
-        .order_by(ChatSession.updated_at.desc())
     )
+    if mode:
+        stmt = stmt.where(ChatSession.mode == mode)
+    stmt = stmt.order_by(ChatSession.updated_at.desc())
     res = await db.execute(stmt)
     sessions = res.scalars().all()
     return {
@@ -1646,6 +1760,7 @@ async def list_chat_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
             {
                 "id": str(s.id),
                 "title": s.title,
+                "mode": s.mode or "drive",
                 "message_count": len(s.messages or []),
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
@@ -1658,20 +1773,34 @@ async def list_chat_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
 @router.post("/sessions")
 async def create_chat_session(payload: CreateSessionRequest, db: AsyncSession = Depends(get_db)):
     """Create a new chat session for a user."""
-    default_welcome = [
-        {
-            "id": "welcome-1",
-            "sender": "ai",
-            "text": "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
-            "time": "Just now",
-            "showSecurityNotice": True,
-            "citations": [],
-            "blockedFiles": [],
-        }
-    ]
+    sess_mode = payload.mode or "drive"
+    if sess_mode == "general":
+        default_welcome = [
+            {
+                "id": f"welcome-general-{int(time.time())}",
+                "sender": "ai",
+                "text": "Hello! I'm your AI Assistant. Ask me anything on programming, technical concepts, learning roadmaps, drafting, or analysis.",
+                "time": "Just now",
+                "citations": [],
+                "blockedFiles": [],
+            }
+        ]
+    else:
+        default_welcome = [
+            {
+                "id": f"welcome-drive-{int(time.time())}",
+                "sender": "ai",
+                "text": "Hello! I'm your AI Drive Assistant. You can select specific documents from your Google Drive catalog on the left, or simply ask a question and I'll automatically find the relevant files for you. Your documents are protected by built-in privacy and security checks.",
+                "time": "Just now",
+                "showSecurityNotice": True,
+                "citations": [],
+                "blockedFiles": [],
+            }
+        ]
     msgs = payload.messages if payload.messages is not None else default_welcome
     session = ChatSession(
         user_id=payload.user_id,
+        mode=sess_mode,
         title=payload.title or "New Chat",
         messages=msgs,
     )
@@ -1681,6 +1810,108 @@ async def create_chat_session(payload: CreateSessionRequest, db: AsyncSession = 
     return {
         "id": str(session.id),
         "title": session.title,
+        "mode": session.mode or "drive",
+        "messages": session.messages or [],
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+    }
+
+
+@router.get("/sessions/other_mode")
+async def list_other_mode_sessions(
+    user_id: str,
+    current_mode: str = Query("drive"),
+    db: AsyncSession = Depends(get_db),
+):
+    """List active sessions from the OTHER mode available to import."""
+    other_mode = "general" if current_mode == "drive" else "drive"
+    stmt = (
+        select(ChatSession)
+        .where(
+            ChatSession.user_id == user_id,
+            ChatSession.mode == other_mode,
+            ChatSession.is_deleted.is_(False),
+        )
+        .order_by(ChatSession.updated_at.desc())
+    )
+    res = await db.execute(stmt)
+    sessions = res.scalars().all()
+    return {
+        "current_mode": current_mode,
+        "other_mode": other_mode,
+        "sessions": [
+            {
+                "id": str(s.id),
+                "title": s.title,
+                "mode": s.mode or other_mode,
+                "message_count": len(s.messages or []),
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            for s in sessions
+        ]
+    }
+
+
+@router.post("/sessions/{session_id}/import_to_mode")
+async def import_session_to_mode(
+    session_id: str,
+    payload: ImportSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Import/clone a session from one mode into the target mode within the same user's account."""
+    stmt = select(ChatSession).where(
+        ChatSession.id == session_id,
+        ChatSession.user_id == payload.user_id,
+        ChatSession.is_deleted.is_(False),
+    )
+    res = await db.execute(stmt)
+    source_session = res.scalar_one_or_none()
+    if not source_session:
+        raise HTTPException(status_code=404, detail="Source chat session not found.")
+
+    source_label = "General" if source_session.mode == "general" else "Drive"
+    new_title = f"{source_session.title} (from {source_label})"
+    new_session = ChatSession(
+        user_id=payload.user_id,
+        mode=payload.target_mode,
+        title=new_title[:255],
+        messages=source_session.messages or [],
+    )
+    db.add(new_session)
+    await db.commit()
+    await db.refresh(new_session)
+    return {
+        "id": str(new_session.id),
+        "title": new_session.title,
+        "mode": new_session.mode,
+        "message_count": len(new_session.messages or []),
+        "messages": new_session.messages or [],
+        "created_at": new_session.created_at.isoformat() if new_session.created_at else None,
+        "updated_at": new_session.updated_at.isoformat() if new_session.updated_at else None,
+    }
+
+
+@router.post("/sessions/import_json")
+async def import_session_from_json(
+    payload: ImportExternalSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Import a chat session from external JSON data into the user's account."""
+    session = ChatSession(
+        user_id=payload.user_id,
+        mode=payload.mode or "drive",
+        title=(payload.title or "Imported Chat")[:255],
+        messages=payload.messages or [],
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "id": str(session.id),
+        "title": session.title,
+        "mode": session.mode,
+        "message_count": len(session.messages or []),
         "messages": session.messages or [],
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,
@@ -1707,6 +1938,7 @@ async def get_chat_session(
     return {
         "id": str(session.id),
         "title": session.title,
+        "mode": session.mode or "drive",
         "messages": session.messages or [],
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,

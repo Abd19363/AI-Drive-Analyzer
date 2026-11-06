@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 from app.services.extractor_service import (
     extract_content,
     refine_candidate_list_pdf_ocr,
@@ -238,3 +238,80 @@ def is_query_about_media(query: str) -> bool:
         if re.search(pattern, q_clean):
             return True
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Query-Level Confidential Data Guardrails
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIDENTIAL_QUERY_RULES = [
+    (
+        "TRANSACTION_AMOUNT",
+        re.compile(
+            r"(?i)\b(?:transaction\s*(?:amount|sum|cost|value|total|figure|fee)|"
+            r"(?:amount|sum|money|payment|funds)\s*(?:sent|transferred|paid|received|deposited|debited|credited)|"
+            r"(?:how\s*much\s*(?:was|money\s*was)?\s*(?:sent|transferred|paid|deposited|debited))|"
+            r"transaction\s*(?:id|details|receipt|slip|reference)|"
+            r"trx\s*(?:id|amount)|txn\s*(?:id|amount)|tid|psid|challan\s*(?:no|number|amount)|"
+            r"transfer\s*(?:receipt|slip|amount)|deposit\s*slip)\b"
+        ),
+        "This is private and confidential information. Transaction amounts, payment receipts, and financial transaction details are protected by our privacy and security guardrails and cannot be disclosed.",
+    ),
+    (
+        "CNIC",
+        re.compile(
+            r"(?i)\b(?:cnic|nic|national\s*id|id\s*card\s*number|identity\s*number|nadra|cnic\s*no)\b"
+        ),
+        "This is private and confidential information. National Identity Card (CNIC) numbers and personal identity records are classified as confidential personal data and cannot be disclosed.",
+    ),
+    (
+        "SALARY",
+        re.compile(
+            r"(?i)\b(?:salary|payslip|pay\s*slip|payroll|compensation|remuneration|basic\s*pay|gross\s*pay|net\s*pay|monthly\s*income|take\s*home\s*pay)\b"
+        ),
+        "This is private and confidential information. Salary slips, payroll records, and employee compensation data are classified as confidential financial information and cannot be disclosed.",
+    ),
+    (
+        "BANKING",
+        re.compile(
+            r"(?i)\b(?:credit\s*card|debit\s*card|card\s*number|cvv|pin\s*code|bank\s*account|account\s*number|iban|account\s*balance|ledger\s*balance|bank\s*statement)\b"
+        ),
+        "This is private and confidential information. Bank account details, IBANs, and payment card numbers are classified as confidential financial information and cannot be disclosed.",
+    ),
+    (
+        "CREDENTIALS",
+        re.compile(
+            r"(?i)\b(?:password|passwords|secret\s*key|api\s*key|private\s*key|access\s*token|auth\s*token|credentials)\b"
+        ),
+        "This is private and confidential information. Passwords, secret keys, and authentication credentials are strictly protected and cannot be disclosed.",
+    ),
+    (
+        "PASSPORT",
+        re.compile(
+            r"(?i)\b(?:passport\s*number|passport\s*no|visa\s*number|citizenship\s*number)\b"
+        ),
+        "This is private and confidential information. Passport details and citizenship documentation are classified as confidential personal records and cannot be disclosed.",
+    ),
+    (
+        "PHONE",
+        re.compile(
+            r"(?i)\b(?:phone\s*number|mobile\s*number|cell\s*number|contact\s*number|whatsapp\s*number|phone\s*no|mobile\s*no|cell\s*no|contact\s*no)\b"
+        ),
+        "This is private and confidential information. Personal phone numbers and mobile contact details are protected by privacy checks and cannot be disclosed.",
+    ),
+]
+
+
+def check_confidential_query(query: str) -> Optional[Tuple[str, str]]:
+    """
+    Evaluates whether the user's query asks for private/confidential personal or financial data.
+    Returns: (category, canned_response) if confidential, or None.
+    """
+    if not query:
+        return None
+    q = query.strip()
+    for category, pattern, response_text in CONFIDENTIAL_QUERY_RULES:
+        if pattern.search(q):
+            return category, response_text
+    return None
+

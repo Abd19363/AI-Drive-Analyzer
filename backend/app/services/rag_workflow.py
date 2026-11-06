@@ -15,6 +15,7 @@ from app.services.guardrail_service import (
     is_media_file,
     is_query_about_media,
     MEDIA_QUERY_RESPONSE,
+    check_confidential_query,
 )
 from app.services.extractor_service import (
     DOCUMENT_EXTRACTION_VERSION,
@@ -62,7 +63,9 @@ class RAGState(TypedDict):
     answer: str
     auto_discovered: bool
     is_media_query: bool
+    is_confidential_query: bool
     needs_general_confirmation: bool
+    mode: Optional[str]
     requested_sheet_name: Optional[str]
     sheet_scoped_safe_files: List[Dict[str, Any]]
     _live_tracker: Optional[Dict[str, Any]]
@@ -72,7 +75,7 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
     Step 1: Identifies candidate files.
     If the user selected specific files in the UI, uses those files directly.
     Otherwise uses AI auto-discovery to find relevant files across Drive.
-    Also detects if the query is asking about images or video files.
+    Also detects if the query is asking about images or video files, or confidential info.
     """
     query = state["query"]
     available_files = state["available_files"]
@@ -80,6 +83,15 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
 
     auto_discovered = False
     query_is_media = is_query_about_media(query)
+    query_is_confidential = bool(check_confidential_query(query))
+
+    if query_is_confidential:
+        return {
+            "candidate_files": [],
+            "auto_discovered": False,
+            "is_media_query": False,
+            "is_confidential_query": True,
+        }
 
     if selected_file_ids:
         # User explicitly selected files — prioritize them directly
@@ -112,6 +124,24 @@ async def node_analyze_query(state: RAGState) -> Dict[str, Any]:
 
         # Fast title match check first (0ms LLM latency)
         title_matches = match_files_by_title(query, available_files, minimum_score=20)
+        # Prefer exact title match for assignment files
+        exact_match = None
+        lowered_query = query.lower()
+        for f in title_matches:
+            name = f.get('name','').lower()
+            if 'e-commerce ai dashboard assignment' in name:
+                exact_match = f
+                break
+        if exact_match:
+            candidate_files = [exact_match]
+            logger.info(f"[RAG] Exact assignment match found: {exact_match.get('name')}")
+        elif title_matches:
+            candidate_files = [f for f in title_matches if not is_media_file(f)]
+            logger.info(f"[RAG] Fast title match found {len(candidate_files)} candidate(s) without LLM: {[f.get('name') for f in candidate_files]}")
+        else:
+            candidate_files = await analyze_query_for_drive_files(query, available_files)
+            candidate_files = [f for f in candidate_files if not is_media_file(f)]
+            logger.info(f"[RAG] Auto-discovery identified {len(candidate_files)} candidate file(s): {[f.get('name') for f in candidate_files]}")
         if title_matches:
             candidate_files = [f for f in title_matches if not is_media_file(f)]
             logger.info(f"[RAG] Fast title match found {len(candidate_files)} candidate(s) without LLM: {[f.get('name') for f in candidate_files]}")
@@ -179,7 +209,7 @@ async def node_guardrail_gate(state: RAGState) -> Dict[str, Any]:
     Step 2: Downloads only candidate files and executes the 4-layer privacy guardrail.
     Files containing CNIC, salary slips, passports, or financial statements are blocked.
     """
-    if state.get("is_media_query"):
+    if state.get("is_media_query") or state.get("is_confidential_query"):
         return {"safe_files": [], "confidential_files": []}
 
     db = state["db"]
@@ -1120,11 +1150,9 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
         await db.commit()
         return {"answer": answer}
 
-    if not retrieved_chunks and not confidential_files:
-        answer = (
-            "The information you're asking about isn't in your Google Drive. "
-            "Would you like me to answer using general knowledge instead?"
-        )
+    conf_check = check_confidential_query(query)
+    if conf_check or state.get("is_confidential_query"):
+        answer = conf_check[1] if conf_check else "This is private and confidential information. Transaction amounts, payment receipts, and financial transaction details are protected by our privacy and security guardrails and cannot be disclosed."
         db.add(ChatQuery(
             user_id=user_id,
             query_text=query,
@@ -1133,7 +1161,31 @@ async def node_synthesize(state: RAGState) -> Dict[str, Any]:
             answer_text=answer,
         ))
         await db.commit()
-        return {"answer": answer, "needs_general_confirmation": True}
+        return {"answer": answer}
+
+    if not retrieved_chunks and not confidential_files:
+        # In Drive mode we should not ask to fall back to general knowledge.
+        if state.get("mode") == "drive":
+            answer = "The information you're asking about isn't in your Google Drive."
+            needs_general = False
+        else:
+            answer = (
+                "The information you're asking about isn't in your Google Drive. "
+                "Would you like me to answer using general knowledge instead?"
+            )
+            needs_general = True
+        db.add(ChatQuery(
+            user_id=user_id,
+            query_text=query,
+            identified_files=[],
+            skipped_files=[],
+            answer_text=answer,
+        ))
+        await db.commit()
+        response = {"answer": answer}
+        if needs_general:
+            response["needs_general_confirmation"] = True
+        return response
 
     if state.get("intent") == "document_search" and not retrieved_chunks:
         searched_names = [

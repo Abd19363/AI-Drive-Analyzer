@@ -1,4 +1,4 @@
-import { HardDrive, RefreshCw, Shield, ShieldCheck, User, LogOut, Sparkles } from "lucide-react";
+import { HardDrive, RefreshCw, Shield, ShieldCheck, User, LogOut, Sparkles, ArrowLeft } from "lucide-react";
 
 export default function Navbar({
   isConnected,
@@ -42,11 +42,11 @@ export default function Navbar({
           <button
             type="button"
             onClick={onGoToLanding}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 hover:text-slate-800 transition-all cursor-pointer"
-            title="Return to Product Overview Landing Page"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 hover:text-slate-900 transition-all cursor-pointer group"
+            title="Return to Main Page"
           >
-            <Sparkles size={13} className="text-blue-600" />
-            <span className="hidden sm:inline">Product</span> Overview
+            <ArrowLeft size={13} className="text-slate-400 group-hover:text-blue-600 group-hover:-translate-x-0.5 transition-all" />
+            <span><span className="hidden sm:inline">Back to </span>Main Page</span>
           </button>
         )}
         <button

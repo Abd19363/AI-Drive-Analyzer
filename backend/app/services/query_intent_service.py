@@ -7,6 +7,7 @@ QueryIntent = Literal[
     "assistant_info",
     "direct_answer",
     "media",
+    "confidential",
     "document_search",
     "drive_inventory",
     "fact",

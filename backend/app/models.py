@@ -122,6 +122,7 @@ class ChatSession(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    mode = Column(String(50), nullable=False, default="drive", index=True) # "drive" or "general"
     title = Column(String(255), nullable=False, default="New Chat")
     messages = Column(JSONB, default=list)
     is_deleted = Column(Boolean, default=False)

@@ -7,7 +7,12 @@ from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
 from app.config import settings
-from app.services.guardrail_service import is_query_about_media, MEDIA_QUERY_RESPONSE, is_media_file
+from app.services.guardrail_service import (
+    is_query_about_media,
+    MEDIA_QUERY_RESPONSE,
+    is_media_file,
+    check_confidential_query,
+)
 from app.services.query_intent_service import (
     is_document_structure_query,
     match_files_by_title,
@@ -115,30 +120,34 @@ def _should_try_fallback(err: Exception) -> bool:
         match = re.search(r"\b(408|429|5\d{2}|404)\b", msg)
         status_code = int(match.group(1)) if match else None
 
-    if status_code == 404 or status_code == 408 or status_code == 429:
+    if status_code in (404, 408, 429):
         return True
     if status_code is not None:
         return 500 <= status_code <= 599
+    if any(k in msg for k in ("UNAVAILABLE", "NOT_FOUND", "NOT FOUND", "RESOURCE_EXHAUSTED", "HIGH DEMAND")):
+        return True
     return isinstance(err, (TimeoutError, ConnectionError))
 
 def generate_content_with_fallback(client, contents, config=None):
     """
-    Use the configured model first, then documented stable Gemini Flash models.
+    Use the configured model first, then documented stable Gemini models.
     The Google SDK handles bounded retries with exponential backoff for transient
     failures; this function only moves to another model after that call fails.
     """
     models = [
-        settings.GEMINI_MODEL,        # Always try the .env-configured model first (gemini-flash-lite-latest)
+        settings.GEMINI_MODEL,        # Primary configured model (e.g. gemini-flash-lite-latest)
         "gemini-flash-lite-latest",   # Active fast model
-        "gemini-2.5-flash",           # High quality fallback
+        "gemini-3.1-flash-lite",      # Stable fast model
+        "gemini-flash-latest",        # Stable flash model
+        "gemini-3.8-flash",           # High capacity flash model
     ]
     seen = set()
     unique_models = [m for m in models if m and not (m in seen or seen.add(m))]
 
     if config is None:
         config = types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=2048,
+            temperature=0.7,
+            max_output_tokens=4096,
         )
 
     last_err = None
@@ -165,17 +174,106 @@ def generate_content_with_fallback(client, contents, config=None):
     ) from last_err
 
 
-async def answer_general_query(query: str) -> str:
-    """Answer general questions without loading or analyzing Drive files."""
-    client = get_gemini_client()
-    prompt = f"""You are a helpful, knowledgeable AI assistant. Answer the user's question clearly, descriptively, and in a well-structured format like modern conversational chatbots.
-Use clean Markdown with appropriate headings (###), readable paragraphs, and bullet points. Do NOT put double asterisks around every line or heading.
-Do not claim to have searched or analyzed their Google Drive. If the answer is uncertain,
-say so rather than inventing details. Do not provide private personal or financial identifiers.
+_COMPREHENSIVE_DETAIL_PATTERN = re.compile(
+    r"\b("
+    r"in\s+(?:great\s+)?detail|detailed|thoroughly|deep\s*dive|comprehensive|complete\s+guide|"
+    r"roadmap|guided\s+lessons|step\s*by\s*step|from\s+scratch|"
+    r"from\s+basics?\s+to\s+advance[d]?|guide\s+me\s+from|curriculum|syllabus|"
+    r"elaborate\s+extensively|system\s+design|full\s+course|"
+    r"\d+\s*(?:month|week|day)s?\s+(?:plan|roadmap|guide|lessons|syllabus)|"
+    r"explain\s+(?:everything|all\s+about)"
+    r")\b",
+    re.IGNORECASE,
+)
 
-User question: {query}"""
-    config = types.GenerateContentConfig(temperature=0.3, max_output_tokens=2048)
-    response = await asyncio.to_thread(generate_content_with_fallback, client, prompt, config)
+_CONCISE_DETAIL_PATTERN = re.compile(
+    r"\b("
+    r"what\s+is\s+this|define\s+this|quick\s+example|briefly|short\s+answer|"
+    r"in\s+short|in\s+brief|quick\s+summary|give\s+a\s+quick|"
+    r"define\b|what\s+is\s+an?\b|what\s+are\b|who\s+is\b|when\s+was\b|where\s+is\b|"
+    r"meaning\s+of\b|syntax\s+of\b|simple\s+example|one\s+line|shortly"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_query_detail_intent(query: str) -> str:
+    """
+    Intelligently infer how much detail the user is seeking:
+    - 'comprehensive': explicit requests for detail, roadmaps, step-by-step curricula
+    - 'concise': quick definitions, "what is this", "define with example", brief facts
+    - 'moderate': balanced standard conversational question
+    """
+    q = query.strip()
+    if _COMPREHENSIVE_DETAIL_PATTERN.search(q):
+        return "comprehensive"
+    if _CONCISE_DETAIL_PATTERN.search(q):
+        return "concise"
+    return "moderate"
+
+
+GENERAL_ASSISTANT_SYSTEM_INSTRUCTION = """You are a highly capable, intelligent, and knowledgeable AI assistant, similar to ChatGPT and Gemini.
+CRITICAL: Calibrate the depth, structure, and length of your response according to the user's intent:
+
+1. Concise & Direct Intent:
+   - When the user asks "What is this?", "Define this with an example", simple factual queries, or quick syntax/concept questions:
+   - Provide a clear, crisp, and direct explanation.
+   - Include a concise, practical example if requested or helpful.
+   - Keep the response focused, readable, and to the point (1-3 short paragraphs or clean bullet points).
+   - Do NOT generate unsolicited multi-page roadmaps, essays, or unnecessary filler.
+
+2. Comprehensive & In-Depth Intent:
+   - When the user asks to "explain in detail", "give a guided roadmap from basics to advanced", "comprehensive guide", "step-by-step", or multi-month learning plans:
+   - Provide an exhaustive, deeply structured, and high-quality guide.
+   - Structure with clear headings (## and ###), chronological phases/modules, recommended tools, milestone projects, Markdown comparison tables, and full code examples with explanations.
+
+3. Moderate / Balanced Intent:
+   - For general questions that fall in between, provide a well-rounded, informative, and structured response with clear concepts and practical takeaways without being overly brief or overwhelmingly long.
+
+Always use clean Markdown (headings, bold text, bullet points, and code blocks). Do not mention Google Drive unless explicitly asked. Never disclose confidential personal or financial data.
+"""
+
+
+async def answer_general_query(
+    query: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Answer general questions with adaptive depth and detail matching the user's intent."""
+    client = get_gemini_client()
+
+    detail_intent = detect_query_detail_intent(query)
+    directive = {
+        "concise": "[User Intent: Concise & Direct. Provide a crisp, succinct explanation with a quick practical example. Avoid excessive length or unsolicited essays.]",
+        "comprehensive": "[User Intent: Comprehensive & In-Depth. Provide an exhaustive, deeply structured guide with phases, milestone projects, and rich detail.]",
+        "moderate": "[User Intent: Balanced. Provide an informative, well-structured answer with good depth and practical context.]",
+    }[detail_intent]
+
+    max_tokens = {
+        "concise": 1536,
+        "moderate": 3072,
+        "comprehensive": 8192,
+    }[detail_intent]
+
+    prompt_parts = []
+    if conversation_history:
+        prompt_parts.append("### Conversation History:")
+        for turn in conversation_history[-6:]:
+            role = "User" if turn.get("role") in ("user", "human") else "AI Assistant"
+            text = (turn.get("text") or "").strip()
+            if text:
+                prompt_parts.append(f"{role}: {text}")
+        prompt_parts.append("\n### Current User Directive & Question:")
+
+    prompt_parts.append(directive)
+    prompt_parts.append(f"User Question: {query}")
+
+    full_prompt = "\n".join(prompt_parts)
+    config = types.GenerateContentConfig(
+        system_instruction=GENERAL_ASSISTANT_SYSTEM_INSTRUCTION,
+        temperature=0.7,
+        max_output_tokens=max_tokens,
+    )
+    response = await asyncio.to_thread(generate_content_with_fallback, client, full_prompt, config)
     if not response.text:
         raise RuntimeError("Gemini returned an empty response for the general question.")
     answer = response.text
@@ -542,6 +640,11 @@ def sanitize_confidential_output(text: str, query: str = "") -> str:
     """
     if not text:
         return text
+
+    if query:
+        conf_match = check_confidential_query(query)
+        if conf_match:
+            return conf_match[1]
 
     q_lower = query.lower() if query else ""
     trx_query = bool(re.search(r"\b(transaction\s*id|trx\s*id|tid|txn\s*id|receipt\s*id|reference\s*number|psid|challan\s*no|challan\s*number|consumer\s*id|consumer\s*number)\b", q_lower))

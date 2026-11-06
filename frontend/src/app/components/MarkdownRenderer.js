@@ -48,10 +48,9 @@ function CodeBlock({ children, className }) {
 export default function MarkdownRenderer({ content }) {
   if (!content) return null;
 
-  // Clean up any rogue orphan asterisks or weird standalone markup artifacts
+  // Clean up any rogue orphan asterisks or weird standalone markup artifacts while preserving markdown headers
   const normalizedContent = content
-    .replace(/^[\s`*"'~_#:]+/g, "")
-    .replace(/[`*"'~_\\#:\s]+$/g, "")
+    .trim()
     .replace(/^(\s*)\*\*(\s*)$/gm, "")
     .replace(/\n{3,}/g, "\n\n");
 

@@ -100,4 +100,27 @@
   animation: scanLine 2.5s ease-in-out infinite;
 }
 
+@keyframes marqueeUp {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(-50%); }
+}
+
+@keyframes marqueeDown {
+  0% { transform: translateY(-50%); }
+  100% { transform: translateY(0); }
+}
+
+.animate-marquee-up {
+  animation: marqueeUp 32s linear infinite;
+}
+
+.animate-marquee-down {
+  animation: marqueeDown 38s linear infinite;
+}
+
+.animate-marquee-up-fast {
+  animation: marqueeUp 26s linear infinite;
+}
+
+
 
