@@ -500,14 +500,14 @@ export default function LandingPage({ onContinue }) {
 
             {/* Trust & Governance Badges */}
             <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
-                <button
-                  type="button"
-                  onClick={() => setActivePolicyModal("privacy")}
-                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/80 shadow-2xs hover:bg-emerald-100 transition-all cursor-pointer"
-                  title="View Zero-Knowledge Privacy Details"
-                >
-                  <ShieldCheck size={13} className="text-emerald-600" />
-                  Zero-Knowledge Verified
+              <button
+                type="button"
+                onClick={() => setActivePolicyModal("privacy")}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/80 shadow-2xs hover:bg-emerald-100 transition-all cursor-pointer"
+                title="View Zero-Knowledge Privacy Details"
+              >
+                <ShieldCheck size={13} className="text-emerald-600" />
+                Zero-Knowledge Verified
               </button>
               <button
                 type="button"
@@ -526,31 +526,31 @@ export default function LandingPage({ onContinue }) {
               >
                 <CheckCircle2 size={12} className="text-emerald-600" />
                 Encrypted at Rest & Transit
-            </button>
-          </div>
-        </div>
-
-        {/* Bottom Row: Copyright, Operational Status & Standards */}
-        <div className="pt-6 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
-          <div>
-            © {new Date().getFullYear()} AI Drive Assistant. All rights reserved.
+              </button>
+            </div>
           </div>
 
-          {/* Operational Status & Links */}
-          <div className="flex flex-wrap items-center gap-5">
-            <span className="flex items-center gap-2 text-slate-700 font-medium">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+          {/* Bottom Row: Copyright, Operational Status & Standards */}
+          <div className="pt-6 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
+            <div>
+              © {new Date().getFullYear()} AI Drive Assistant. All rights reserved.
+            </div>
+
+            {/* Operational Status & Links */}
+            <div className="flex flex-wrap items-center gap-5">
+              <span className="flex items-center gap-2 text-slate-700 font-medium">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                All Systems Operational
               </span>
-              All Systems Operational
-            </span>
-            <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
             <Link
-              href="/privacy-policy"
-              className="text-slate-600 hover:text-blue-600 font-medium transition-colors cursor-pointer hover:underline"
-            >
-              Privacy Policy
+                href="/privacy-policy"
+                className="text-slate-600 hover:text-blue-600 font-medium transition-colors cursor-pointer hover:underline"
+              >
+                Privacy Policy
             </Link>
             <span className="text-slate-300 hidden sm:inline">•</span>
             <button
@@ -630,8 +630,8 @@ export default function LandingPage({ onContinue }) {
               type="button"
               onClick={() => setActivePolicyModal("privacy")}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activePolicyModal === "privacy"
-                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200/80 shadow-2xs"
-                  : "text-slate-500 hover:text-slate-800"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200/80 shadow-2xs"
+                : "text-slate-500 hover:text-slate-800"
                 }`}
             >
               Privacy Policy
@@ -640,8 +640,8 @@ export default function LandingPage({ onContinue }) {
               type="button"
               onClick={() => setActivePolicyModal("security")}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activePolicyModal === "security"
-                  ? "bg-blue-50 text-blue-700 border border-blue-200/80 shadow-2xs"
-                  : "text-slate-500 hover:text-slate-800"
+                ? "bg-blue-50 text-blue-700 border border-blue-200/80 shadow-2xs"
+                : "text-slate-500 hover:text-slate-800"
                 }`}
             >
               Security Standards
@@ -650,8 +650,8 @@ export default function LandingPage({ onContinue }) {
               type="button"
               onClick={() => setActivePolicyModal("terms")}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activePolicyModal === "terms"
-                  ? "bg-indigo-50 text-indigo-700 border border-indigo-200/80 shadow-2xs"
-                  : "text-slate-500 hover:text-slate-800"
+                ? "bg-indigo-50 text-indigo-700 border border-indigo-200/80 shadow-2xs"
+                : "text-slate-500 hover:text-slate-800"
                 }`}
             >
               Terms of Service
