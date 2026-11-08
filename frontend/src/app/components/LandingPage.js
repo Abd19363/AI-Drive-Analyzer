@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import {
   HardDrive,
   ArrowRight,
@@ -19,6 +20,7 @@ import {
   Layers,
   KeyRound,
   ShieldAlert,
+  ExternalLink,
   X
 } from "lucide-react";
 
@@ -544,13 +546,12 @@ export default function LandingPage({ onContinue }) {
               All Systems Operational
             </span>
             <span className="text-slate-300 hidden sm:inline">•</span>
-            <button
-              type="button"
-              onClick={() => setActivePolicyModal("privacy")}
+            <Link
+              href="/privacy-policy"
               className="text-slate-600 hover:text-blue-600 font-medium transition-colors cursor-pointer hover:underline"
             >
               Privacy Policy
-            </button>
+            </Link>
             <span className="text-slate-300 hidden sm:inline">•</span>
             <button
               type="button"
@@ -661,6 +662,22 @@ export default function LandingPage({ onContinue }) {
           <div className="flex-1 overflow-y-auto p-6 space-y-4 text-xs text-slate-600 leading-relaxed scrollbar-thin scrollbar-thumb-slate-200">
             {activePolicyModal === "privacy" && (
               <div className="space-y-4 animate-fade-in">
+                {/* Official Link Banner */}
+                <div className="flex items-center justify-between p-3 rounded-2xl bg-emerald-50/80 border border-emerald-200/80 text-xs">
+                  <div>
+                    <span className="font-bold text-emerald-900 block">Official Application Privacy Policy</span>
+                    <span className="text-[11px] text-emerald-700">Last updated: November 8, 2026</span>
+                  </div>
+                  <Link
+                    href="/privacy-policy"
+                    target="_blank"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 text-white font-semibold text-xs hover:bg-emerald-700 transition-colors shadow-2xs"
+                  >
+                    <span>View Dedicated Page</span>
+                    <ExternalLink size={12} />
+                  </Link>
+                </div>
+
                 {/* Highlight card for No Query Storage Policy */}
                 <div className="p-3.5 rounded-2xl bg-blue-50/80 border border-blue-200/80 space-y-1.5">
                   <div className="flex items-center gap-1.5 font-bold text-blue-900 text-[13px]">

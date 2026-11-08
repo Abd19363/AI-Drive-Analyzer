@@ -9,6 +9,7 @@ warnings.filterwarnings(
 )
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Enable OAuth2 over HTTP for local development
@@ -127,3 +128,10 @@ def health_check():
         "embedding_model": settings.EMBEDDING_MODEL_NAME,
         "embedding_dimensions": settings.EMBEDDING_DIM
     }
+
+
+@app.get("/privacy-policy")
+def privacy_policy_redirect():
+    frontend_base = (settings.FRONTEND_URL or "https://ai-drive-assistant.duckdns.org").rstrip("/")
+    return RedirectResponse(url=f"{frontend_base}/privacy-policy")
+

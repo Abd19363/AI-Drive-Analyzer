@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import {
   Lock,
   Mail,
@@ -600,6 +601,12 @@ export default function UserPortalAuth({ onAuthenticated }) {
             )}
           </div>
         )}
+        <div className="mt-4 pt-3 border-t border-slate-100 text-center text-[11px] text-slate-400">
+          By signing in or registering, you agree to our{" "}
+          <Link href="/privacy-policy" className="text-blue-600 hover:underline font-medium">
+            Privacy Policy
+          </Link>
+        </div>
       </div>
     </div>
   );

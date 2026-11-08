@@ -88,7 +88,15 @@ export default function DriveConnector({
           <p className="text-xs text-slate-500 mt-0.5 leading-relaxed max-w-2xl">
             Choose any Google Drive account of your choice to link with this session.{" "}
             <strong className="text-slate-800 font-semibold">Your files remain strictly private</strong>
-            {" "}— processed securely only when you ask questions.
+            {" "}— processed securely only when you ask questions. Read-only permissions governed by our{" "}
+            <a
+              href="/privacy-policy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:underline font-medium inline-flex items-center gap-0.5"
+            >
+              <span>Privacy Policy</span>
+            </a>.
           </p>
           {portalEmail && (
             <p className="text-[11px] text-slate-400 mt-1">
