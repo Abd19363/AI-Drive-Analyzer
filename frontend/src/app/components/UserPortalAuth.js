@@ -603,6 +603,10 @@ export default function UserPortalAuth({ onAuthenticated }) {
         )}
         <div className="mt-4 pt-3 border-t border-slate-100 text-center text-[11px] text-slate-400">
           By signing in or registering, you agree to our{" "}
+          <Link href="/terms-of-service" className="text-blue-600 hover:underline font-medium">
+            Terms of Service
+          </Link>{" "}
+          and{" "}
           <Link href="/privacy-policy" className="text-blue-600 hover:underline font-medium">
             Privacy Policy
           </Link>

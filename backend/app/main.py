@@ -135,3 +135,11 @@ def privacy_policy_redirect():
     frontend_base = (settings.FRONTEND_URL or "https://ai-drive-assistant.duckdns.org").rstrip("/")
     return RedirectResponse(url=f"{frontend_base}/privacy-policy")
 
+
+@app.get("/terms-of-service")
+@app.get("/terms")
+def terms_of_service_redirect():
+    frontend_base = (settings.FRONTEND_URL or "https://ai-drive-assistant.duckdns.org").rstrip("/")
+    return RedirectResponse(url=f"{frontend_base}/terms-of-service")
+
+

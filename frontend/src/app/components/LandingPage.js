@@ -561,13 +561,12 @@ export default function LandingPage({ onContinue }) {
               Security Standards
             </button>
             <span className="text-slate-300 hidden sm:inline">•</span>
-            <button
-              type="button"
-              onClick={() => setActivePolicyModal("terms")}
+            <Link
+              href="/terms-of-service"
               className="text-slate-600 hover:text-blue-600 font-medium transition-colors cursor-pointer hover:underline"
             >
               Terms of Service
-            </button>
+            </Link>
           </div>
         </div>
     </div>
@@ -770,6 +769,22 @@ export default function LandingPage({ onContinue }) {
 
             {activePolicyModal === "terms" && (
               <div className="space-y-4 animate-fade-in">
+                {/* Official Link Banner */}
+                <div className="flex items-center justify-between p-3 rounded-2xl bg-indigo-50/80 border border-indigo-200/80 text-xs">
+                  <div>
+                    <span className="font-bold text-indigo-900 block">Official Terms of Service</span>
+                    <span className="text-[11px] text-indigo-700">Effective Date: November 8, 2026</span>
+                  </div>
+                  <Link
+                    href="/terms-of-service"
+                    target="_blank"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 text-white font-semibold text-xs hover:bg-indigo-700 transition-colors shadow-2xs"
+                  >
+                    <span>View Dedicated Page</span>
+                    <ExternalLink size={12} />
+                  </Link>
+                </div>
+
                 <div className="p-3.5 rounded-2xl bg-indigo-50/80 border border-indigo-200/80 space-y-1">
                   <div className="flex items-center gap-1.5 font-bold text-indigo-900 text-[13px]">
                     <FileText size={15} className="text-indigo-600 flex-shrink-0" />

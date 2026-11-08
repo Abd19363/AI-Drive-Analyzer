@@ -715,6 +715,10 @@ export default function PrivacyPolicyPage() {
               Privacy Policy
             </Link>
             <span>•</span>
+            <Link href="/terms-of-service" className="hover:text-blue-600 transition-colors">
+              Terms of Service
+            </Link>
+            <span>•</span>
             <a
               href="mailto:daralc19@gmail.com"
               className="hover:text-blue-600 transition-colors"
